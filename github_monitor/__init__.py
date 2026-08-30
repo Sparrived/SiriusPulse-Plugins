@@ -149,8 +149,15 @@ class GitHubMonitorPlugin(PluginBase):
         last_event_id = str(store.get(f"last_event_id:{key}", ""))
         payload = await fetch_repo_events(client, owner, repo, per_page=30)
 
+        if not last_event_id:
+            # 首次同步只建立游标，不播报已有历史活动。
+            newest_id = str(payload[0].get("id", "")) if payload else ""
+            if newest_id:
+                store.set(f"last_event_id:{key}", newest_id)
+            return 0
+
         new_events: list[dict[str, Any]] = []
-        cursor_found = not last_event_id
+        cursor_found = False
         for event in reversed(payload):
             if not isinstance(event, dict):
                 continue
@@ -163,13 +170,18 @@ class GitHubMonitorPlugin(PluginBase):
             if cursor_found and self._event_enabled(event, enabled_events):
                 new_events.append(event)
 
+        # Events API 只返回有限页数；游标不在当前页时，当前页事件都应视为新事件，
+        # 否则高频仓库会在一次轮询间隔内静默丢失更新。
+        if not cursor_found:
+            new_events = [
+                event
+                for event in reversed(payload)
+                if isinstance(event, dict) and self._event_enabled(event, enabled_events)
+            ]
+
         if payload:
             newest_id = str(payload[0].get("id", ""))
             if newest_id:
-                if not last_event_id:
-                    # 首次同步只建立游标，不播报已有历史活动。
-                    store.set(f"last_event_id:{key}", newest_id)
-                    return 0
                 store.set(f"last_event_id:{key}", newest_id)
 
         sent = 0
