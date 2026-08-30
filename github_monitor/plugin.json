@@ -1,0 +1,17 @@
+{
+  "name": "github_monitor",
+  "display_name": "GitHub Monitor",
+  "description": "监控 GitHub 仓库的 Issue、PR、Release 和 Push 动态。",
+  "version": "0.1.0",
+  "author": "Sparrived",
+  "min_framework_version": "1.3.0",
+  "permissions": {
+    "hidden_from_intent": true,
+    "rate_limit": {
+      "calls_per_minute": 20,
+      "calls_per_hour": 300
+    }
+  },
+  "dependencies": [],
+  "resources": []
+}
