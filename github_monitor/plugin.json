@@ -12,6 +12,6 @@
       "calls_per_hour": 300
     }
   },
-  "dependencies": [],
+  "dependencies": ["httpx>=0.24.0"],
   "resources": []
 }
