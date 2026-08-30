@@ -5,7 +5,12 @@ from __future__ import annotations
 from typing import Any
 
 from sirius_pulse.github import GitHubClient, fetch_repo_events
-from sirius_pulse.plugins.api import BackgroundTaskSpec, PluginBase, PluginResponse, command
+from sirius_pulse.plugins.api import (
+    BackgroundTaskSpec,
+    PluginBase,
+    PluginResponse,
+    command,
+)
 
 
 class GitHubMonitorPlugin(PluginBase):
@@ -83,9 +88,7 @@ class GitHubMonitorPlugin(PluginBase):
             return PluginResponse.ok(text=f"GitHub 监控已完成一次轮询，发送 {count} 条通知。")
         if action in {"status", "状态", ""}:
             repos = self._configured_repos()
-            return PluginResponse.ok(
-                text=f"GitHub 监控运行中，已配置 {len(repos)} 个仓库。"
-            )
+            return PluginResponse.ok(text=f"GitHub 监控运行中，已配置 {len(repos)} 个仓库。")
         return PluginResponse.fail("用法：/github status 或 /github poll")
 
     def create_background_tasks(self) -> list[BackgroundTaskSpec]:
@@ -111,7 +114,9 @@ class GitHubMonitorPlugin(PluginBase):
         if not repos:
             return 0
 
-        base_url = str(self.ctx.config.get("api_base_url", "https://api.github.com")).rstrip("/")
+        base_url = str(
+            self.ctx.config.get("api_base_url", "https://api.github.com")
+        ).rstrip("/")
         token = str(self.ctx.config.get("github_token", "")).strip()
         sent = 0
         async with GitHubClient(token, base_url=base_url, timeout=30.0) as client:
@@ -194,7 +199,9 @@ class GitHubMonitorPlugin(PluginBase):
     @staticmethod
     def _format_event(event: dict[str, Any], repo_key: str) -> str:
         event_type = str(event.get("type", "GitHubEvent"))
-        actor = (event.get("actor") or {}).get("display_login") or (event.get("actor") or {}).get("login", "未知用户")
+        actor = (event.get("actor") or {}).get("display_login") or (
+            event.get("actor") or {}
+        ).get("login", "未知用户")
         payload = event.get("payload") or {}
         action = str(payload.get("action", "更新"))
         title = ""

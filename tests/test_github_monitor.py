@@ -21,10 +21,13 @@ async def test_first_poll_only_initializes_cursor(monkeypatch, tmp_path):
     sent: list[dict] = []
     store = PluginDataStore(tmp_path, "github_monitor")
     plugin = GitHubMonitorPlugin()
+
     async def dispatch(**kwargs):
         sent.append(kwargs)
 
-    plugin._ctx = SimpleNamespace(config={}, data_store=store, dispatch_proactive_message=dispatch)
+    plugin._ctx = SimpleNamespace(
+        config={}, data_store=store, dispatch_proactive_message=dispatch
+    )
 
     async def fake_fetch(*_args, **_kwargs):
         return payload
@@ -58,10 +61,13 @@ async def test_poll_sends_new_enabled_events(monkeypatch, tmp_path):
     store = PluginDataStore(tmp_path, "github_monitor")
     store.set("last_event_id:owner/repo", "event-1")
     plugin = GitHubMonitorPlugin()
+
     async def dispatch(**kwargs):
         sent.append(kwargs)
 
-    plugin._ctx = SimpleNamespace(config={}, data_store=store, dispatch_proactive_message=dispatch)
+    plugin._ctx = SimpleNamespace(
+        config={}, data_store=store, dispatch_proactive_message=dispatch
+    )
 
     async def fake_fetch(*_args, **_kwargs):
         return payload
