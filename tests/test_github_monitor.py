@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from github_monitor import GitHubMonitorPlugin
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from github_monitor import GitHubMonitorPlugin  # noqa: E402
 from sirius_pulse.plugins.context import PluginDataStore
 
 
