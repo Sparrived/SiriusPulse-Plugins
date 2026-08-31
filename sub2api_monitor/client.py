@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
-import re
 import time
 from typing import Any
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 import httpx
 
-from .data import normalize_group_rates, normalize_subscriptions
+from .data import (
+    DataNormalizationError,
+    is_group_rate_field,
+    normalize_group_rates,
+    normalize_subscriptions,
+    redact,
+)
 
 
 class Sub2APIError(RuntimeError):
@@ -56,9 +62,9 @@ class Sub2APIClient:
         self.timezone = timezone.strip()
         try:
             timeout_value = float(timeout)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             timeout_value = float("nan")
-        self.timeout = max(1.0, timeout_value) if math.isfinite(timeout_value) else timeout_value
+        self.timeout = timeout_value
         self.allow_insecure_http = allow_insecure_http
         self._transport = transport
         self._http: httpx.AsyncClient | None = None
@@ -121,8 +127,7 @@ class Sub2APIClient:
     async def _login_unlocked(self) -> None:
         if not self.email or not self.password:
             raise Sub2APIError(
-                "未配置 Sub2API 登录凭据，请填写 email/password 或设置 "
-                "SUB2API_EMAIL、SUB2API_PASSWORD 环境变量"
+                "未配置 Sub2API 登录凭据，请设置 SUB2API_EMAIL 和 SUB2API_PASSWORD 环境变量"
             )
         payload = await self._request_json(
             "POST",
@@ -172,7 +177,10 @@ class Sub2APIClient:
                 raise Sub2APIError("Sub2API 订阅响应缺少有效的列表字段")
         elif not isinstance(data, list):
             raise Sub2APIError("Sub2API 订阅响应格式无效")
-        return normalize_subscriptions(payload)
+        try:
+            return normalize_subscriptions(payload)
+        except DataNormalizationError as exc:
+            raise Sub2APIError(f"Sub2API 订阅响应格式无效：{exc}") from exc
 
     async def fetch_group_rates(self) -> list[dict[str, Any]]:
         """Fetch and normalize current group rate multipliers."""
@@ -180,7 +188,10 @@ class Sub2APIClient:
         data = _validated_data(payload, endpoint_name="分组倍率")
         if not _is_group_rate_payload(data):
             raise Sub2APIError("Sub2API 分组倍率响应缺少有效的倍率字段")
-        return normalize_group_rates(payload)
+        try:
+            return normalize_group_rates(payload)
+        except DataNormalizationError as exc:
+            raise Sub2APIError(f"Sub2API 分组倍率响应格式无效：{exc}") from exc
 
     async def _get(self, endpoint: str) -> Any:
         await self._ensure_auth()
@@ -235,25 +246,27 @@ class Sub2APIClient:
             )
 
         if not response.is_success:
-            message = self._redact_secrets(_response_message(response))
+            message = self._redact_secrets(_response_message(response))[:300]
             raise Sub2APIError(f"Sub2API HTTP {response.status_code}：{message}")
         try:
             payload = response.json()
         except ValueError as exc:
             raise Sub2APIError("Sub2API 返回的不是 JSON") from exc
         if isinstance(payload, dict) and _payload_indicates_failure(payload):
-            message = str(
+            detail = (
                 payload.get("message")
                 or payload.get("error")
                 or payload.get("detail")
                 or "接口返回失败"
             )
-            raise Sub2APIError(f"Sub2API 接口失败：{self._redact_secrets(message)[:300]}")
+            message = self._redact_secrets(_safe_error_detail(detail))[:300]
+            raise Sub2APIError(f"Sub2API 接口失败：{message}")
         return payload
 
     def _redact_secrets(self, message: str) -> str:
         for secret in (
             self.password,
+            self.email,
             self._access_token,
             self._refresh_token,
         ):
@@ -262,7 +275,9 @@ class Sub2APIClient:
         return message
 
     def _set_tokens(self, data: Any, *, require_refresh: bool) -> None:
-        token = _token_string(_first_non_empty(data, "access_token", "accessToken", "token"))
+        token = _token_string(
+            _first_non_empty(data, "access_token", "accessToken", "token")
+        )
         if token is None:
             raise Sub2APIError("Sub2API 认证响应中没有有效的 access token")
         refresh = _token_string(_first_non_empty(data, "refresh_token", "refreshToken"))
@@ -292,9 +307,7 @@ class Sub2APIClient:
     def _validate_transport_security(self) -> None:
         parsed = _parse_origin(self.base_url)
         if parsed is None:
-            raise Sub2APIError(
-                "base_url 必须是有效的 http(s) 地址，且不能包含用户名、密码或控制字符"
-            )
+            raise Sub2APIError("base_url 必须是有效的 http(s) 地址，且不能包含用户名、密码或控制字符")
         scheme, host, _port, _origin = parsed
         if scheme == "https":
             return
@@ -322,7 +335,11 @@ class Sub2APIClient:
             endpoint_origin = _parse_origin(endpoint)
             if endpoint_origin is None or endpoint_origin[:3] != base_origin[:3]:
                 raise Sub2APIError("Sub2API 接口 URL 必须与 base_url 同源")
-        elif parsed_endpoint.fragment or parsed_endpoint.netloc or endpoint.startswith("\\\\"):
+        elif (
+            parsed_endpoint.fragment
+            or parsed_endpoint.netloc
+            or endpoint.startswith("\\\\")
+        ):
             raise Sub2APIError("Sub2API 接口路径不得包含 fragment、userinfo 或其他主机")
         if parsed_endpoint.fragment:
             raise Sub2APIError("Sub2API 接口路径不得包含 fragment")
@@ -335,8 +352,10 @@ class Sub2APIClient:
         if _is_absolute_url(endpoint):
             path = endpoint_path
         else:
-            if endpoint_path.startswith("/") and api_prefix and not _under_prefix(
-                endpoint_path, api_prefix
+            if (
+                endpoint_path.startswith("/")
+                and api_prefix
+                and not _under_prefix(endpoint_path, api_prefix)
             ):
                 if endpoint_path.startswith("/api/"):
                     raise Sub2APIError("Sub2API 接口路径必须位于配置的 API 根路径下")
@@ -350,7 +369,9 @@ class Sub2APIClient:
 
         if api_prefix and not _under_prefix(path, api_prefix):
             raise Sub2APIError("Sub2API 接口路径必须位于配置的 API 根路径下")
-        return urlunsplit((origin_url.scheme, origin_url.netloc, path, parsed_endpoint.query, ""))
+        return urlunsplit(
+            (origin_url.scheme, origin_url.netloc, path, parsed_endpoint.query, "")
+        )
 
 
 def _validated_data(payload: Any, *, endpoint_name: str) -> Any:
@@ -375,50 +396,34 @@ def _is_group_rate_payload(data: Any) -> bool:
                 return True
     if found_wrapper:
         return False
-    return all(_is_group_rate_record(value, allow_scalar=True) for value in data.values())
+    return all(
+        _is_group_rate_record(value, allow_scalar=True) for value in data.values()
+    )
 
 
 def _is_group_rate_collection(value: Any) -> bool:
     if isinstance(value, list):
         return all(_is_group_rate_record(item) for item in value)
     if isinstance(value, dict):
-        return all(_is_group_rate_record(item, allow_scalar=True) for item in value.values())
+        return all(
+            _is_group_rate_record(item, allow_scalar=True) for item in value.values()
+        )
     return False
 
 
 def _is_group_rate_record(value: Any, *, allow_scalar: bool = False) -> bool:
-    if allow_scalar and isinstance(value, (int, float)) and not isinstance(value, bool):
-        return math.isfinite(float(value))
-    if allow_scalar and isinstance(value, str):
-        try:
-            number = float(value)
-        except ValueError:
-            return False
-        return math.isfinite(number)
+    if (
+        allow_scalar
+        and isinstance(value, (int, float, str))
+        and not isinstance(value, bool)
+    ):
+        return _finite_number(value)
     if not isinstance(value, dict):
         return False
-    field_values = {
-        _normalize_field_name(key): field_value for key, field_value in value.items()
-    }
-    rate_fields = {
-        key: field_value
-        for key, field_value in field_values.items()
-        if _is_rate_field(key)
-    }
-    return bool(rate_fields) and all(_finite_number(item) for item in rate_fields.values())
-
-
-def _normalize_field_name(value: Any) -> str:
-    text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(value))
-    return re.sub(r"[^a-z0-9]+", "_", text.casefold()).strip("_")
-
-
-def _is_rate_field(field_name: str) -> bool:
-    if field_name in {"value", "ratio", "weight", "rate", "multiplier"}:
-        return True
-    if any(marker in field_name for marker in ("limit", "quota", "capacity", "concurr", "rpm", "tpm", "rpd", "tpd")):
-        return False
-    return "ratio" in field_name or "multiplier" in field_name or "rate" in field_name
+    rate_fields = [
+        field_value for key, field_value in value.items() if is_group_rate_field(key)
+    ]
+    return bool(rate_fields) and all(_finite_number(item) for item in rate_fields)
 
 
 def _finite_number(value: Any) -> bool:
@@ -426,7 +431,7 @@ def _finite_number(value: Any) -> bool:
         return False
     try:
         return math.isfinite(float(value))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return False
 
 
@@ -460,7 +465,7 @@ def _is_success_code(value: Any) -> bool:
         return False
     if isinstance(value, str):
         return value.strip().casefold() in {"0", "200", "ok", "success"}
-    return value in {0, 200}
+    return isinstance(value, (int, float)) and value in (0, 200)
 
 
 def _payload_indicates_failure(payload: dict[str, Any]) -> bool:
@@ -470,7 +475,7 @@ def _payload_indicates_failure(payload: dict[str, Any]) -> bool:
         if key not in payload:
             continue
         value = payload[key]
-        if value is False:
+        if value is False or (isinstance(value, (int, float)) and value == 0):
             return True
         if isinstance(value, str) and value.strip().casefold() in {
             "0",
@@ -491,7 +496,7 @@ def _payload_indicates_failure(payload: dict[str, Any]) -> bool:
 def _positive_float(value: Any) -> float | None:
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return number if math.isfinite(number) and number > 0 else None
 
@@ -524,11 +529,15 @@ def _parse_origin(value: str) -> tuple[str, str, int, str] | None:
     host = parsed.hostname.casefold().rstrip(".")
     if not host:
         return None
-    effective_port = port or (443 if scheme == "https" else 80)
+    effective_port = port if port is not None else (443 if scheme == "https" else 80)
     if not 1 <= effective_port <= 65535:
         return None
     display_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
-    display_port = "" if effective_port == (443 if scheme == "https" else 80) else f":{effective_port}"
+    display_port = (
+        ""
+        if effective_port == (443 if scheme == "https" else 80)
+        else f":{effective_port}"
+    )
     return scheme, host, effective_port, f"{scheme}://{display_host}{display_port}"
 
 
@@ -542,7 +551,12 @@ def _normal_path(path: str) -> str:
     path = path or "/"
     if not path.startswith("/"):
         path = "/" + path
-    decoded = unquote(path)
+    decoded = path
+    for _ in range(4):
+        unescaped = unquote(decoded)
+        if unescaped == decoded:
+            break
+        decoded = unescaped
     if "\\" in decoded or _has_control_character(decoded):
         raise Sub2APIError("Sub2API 接口路径包含非法字符")
     segments = decoded.split("/")
@@ -554,7 +568,10 @@ def _normal_path(path: str) -> str:
 def _safe_api_prefix(value: str) -> str:
     if not value:
         return ""
-    parsed = urlsplit(value)
+    try:
+        parsed = urlsplit(value)
+    except ValueError as exc:
+        raise Sub2APIError("api_base_path 必须是 origin-relative 路径") from exc
     if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
         raise Sub2APIError("api_base_path 必须是 origin-relative 路径")
     path = _normal_path(parsed.path)
@@ -571,13 +588,20 @@ def _under_prefix(path: str, prefix: str) -> bool:
     return path == prefix or path.startswith(f"{prefix}/")
 
 
+def _safe_error_detail(value: Any) -> str:
+    """Serialize a remote error after recursive field-name-based redaction."""
+    sanitized = redact(value, field_name="error")
+    if isinstance(sanitized, (dict, list)):
+        return json.dumps(sanitized, ensure_ascii=False, sort_keys=True, default=str)
+    return str(sanitized)
+
+
 def _response_message(response: httpx.Response) -> str:
     try:
         payload = response.json()
-        if isinstance(payload, dict):
-            message = payload.get("message") or payload.get("error")
-            if message:
-                return str(message)[:300]
     except ValueError:
-        pass
-    return "请求失败"
+        return "请求失败"
+    if not isinstance(payload, dict):
+        return "请求失败"
+    detail = payload.get("message") or payload.get("error") or payload.get("detail")
+    return _safe_error_detail(detail) if detail else "请求失败"

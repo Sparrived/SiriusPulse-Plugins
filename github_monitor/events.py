@@ -99,7 +99,9 @@ async def fetch_repo_events(
                 if attempt < max_retries:
                     await asyncio.sleep(2.0 * attempt)
                     continue
-                return EventFetchResult(collected, success=False, complete=False, error=last_error)
+                return EventFetchResult(
+                    collected, success=False, complete=False, error=last_error
+                )
             status_code = getattr(response, "status_code", 0)
             if status_code in (403, 429):
                 last_error = f"HTTP {status_code}"
@@ -114,7 +116,9 @@ async def fetch_repo_events(
                 if attempt < max_retries:
                     await asyncio.sleep(_retry_delay(response, attempt))
                     continue
-                return EventFetchResult(collected, success=False, complete=False, error=last_error)
+                return EventFetchResult(
+                    collected, success=False, complete=False, error=last_error
+                )
             if status_code == 200:
                 try:
                     data = response.json()
@@ -127,7 +131,10 @@ async def fetch_repo_events(
                     )
                 if not isinstance(data, list):
                     return EventFetchResult(
-                        collected, success=False, complete=False, error="Events API returned non-list"
+                        collected,
+                        success=False,
+                        complete=False,
+                        error="Events API returned non-list",
                     )
                 page_data = [item for item in data if isinstance(item, dict)]
                 break
@@ -136,14 +143,20 @@ async def fetch_repo_events(
             if attempt < max_retries:
                 await asyncio.sleep(2.0 * attempt)
                 continue
-            return EventFetchResult(collected, success=False, complete=False, error=last_error)
+            return EventFetchResult(
+                collected, success=False, complete=False, error=last_error
+            )
         if page_data is None:
-            return EventFetchResult(collected, success=False, complete=False, error=last_error)
+            return EventFetchResult(
+                collected, success=False, complete=False, error=last_error
+            )
         for event in page_data:
             event_id = str(event.get("id", "")).strip()
             if not event_id:
                 try:
-                    event_id = json.dumps(event, sort_keys=True, ensure_ascii=False)[:2000]
+                    event_id = json.dumps(event, sort_keys=True, ensure_ascii=False)[
+                        :2000
+                    ]
                 except (TypeError, ValueError):
                     event_id = repr(event)
             if event_id not in seen_ids:
@@ -154,7 +167,9 @@ async def fetch_repo_events(
             break
         if page >= max_pages:
             logger.warning("github: %s/%s Events API 达到分页预算，暂不确认游标", owner, repo)
-            return EventFetchResult(collected, success=True, complete=False, error="page budget")
+            return EventFetchResult(
+                collected, success=True, complete=False, error="page budget"
+            )
     logger.debug("github: %s/%s 获取到 %d 条事件", owner, repo, len(collected))
     return EventFetchResult(collected, success=True, complete=True)
 

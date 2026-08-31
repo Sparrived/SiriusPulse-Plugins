@@ -1,16 +1,16 @@
 {
-  "base_url": "https://mollycloud.cn/keys",
+  "base_url": "https://sub2api.example.invalid/keys",
   "api_base_path": "/api/v1",
   "login_path": "/auth/login",
   "refresh_path": "/auth/refresh",
   "logout_path": "/auth/logout",
-  "subscriptions_path": "/payment/checkout-info",
-  "group_rates_path": "/groups/rates",
+  "subscriptions_path": "/your/subscriptions-path",
+  "group_rates_path": "/your/group-rates-path",
   "timezone": "Asia/Shanghai",
   "poll_seconds": 300,
   "timeout": 20,
   "allow_insecure_http": false,
   "notify_group_ids": [],
   "adapter_type": "napcat",
-  "run_on_persona": ""
+  "run_on_persona": "your-persona-name"
 }

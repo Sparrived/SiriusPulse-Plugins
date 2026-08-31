@@ -20,7 +20,13 @@ from sirius_pulse.plugins.api import (
 from sirius_pulse.plugins.models import CommandAST
 
 from .client import Sub2APIClient, Sub2APIError
-from .data import PollResult, RecordChange, canonical_record, diff_records
+from .data import (
+    PollResult,
+    RecordChange,
+    canonical_record,
+    comparison_record,
+    diff_records,
+)
 
 
 class Sub2APIMonitorPlugin(PluginBase):
@@ -90,13 +96,6 @@ class Sub2APIMonitorPlugin(PluginBase):
             "group": "Sub2API 连接",
         },
         {
-            "name": "email",
-            "type": "str",
-            "description": "登录邮箱；也可使用 SUB2API_EMAIL 环境变量。",
-            "default": "",
-            "group": "Sub2API 认证",
-        },
-        {
             "name": "timezone",
             "type": "str",
             "description": "GET 接口的 timezone 查询参数；留空则不发送。",
@@ -108,6 +107,8 @@ class Sub2APIMonitorPlugin(PluginBase):
             "type": "int",
             "description": "轮询间隔（秒），最小 30 秒。",
             "default": 300,
+            "minimum": 30,
+            "maximum": 86400,
             "group": "Sub2API 监控",
         },
         {
@@ -115,6 +116,8 @@ class Sub2APIMonitorPlugin(PluginBase):
             "type": "float",
             "description": "单次 HTTP 请求超时（秒）。",
             "default": 20,
+            "minimum": 1,
+            "maximum": 300,
             "group": "Sub2API 连接",
         },
         {
@@ -141,7 +144,7 @@ class Sub2APIMonitorPlugin(PluginBase):
         {
             "name": "run_on_persona",
             "type": "str",
-            "description": "可选：仅由指定人格运行后台轮询，避免多人格重复通知。",
+            "description": "必填：唯一负责轮询的 Persona 名称；留空将禁用后台与手动轮询。",
             "default": "",
             "group": "Sub2API 监控",
         },
@@ -221,10 +224,23 @@ class Sub2APIMonitorPlugin(PluginBase):
             if action in {"reset", "重置"}:
                 async with self._poll_lock:
                     store = self.get_data_store()
-                    store.delete("subscriptions_snapshot")
-                    store.delete("subscriptions_source")
-                    store.delete("group_rates_snapshot")
-                    store.delete("group_rates_source")
+                    clear = getattr(store, "clear", None)
+                    if callable(clear):
+                        clear()
+                    else:
+                        store.delete_many(
+                            [
+                                "subscriptions_snapshot",
+                                "subscriptions_source",
+                                "group_rates_snapshot",
+                                "group_rates_source",
+                                "notification_acks",
+                                "last_poll_attempt_at",
+                                "last_poll_at",
+                                "last_poll_success_at",
+                                "last_poll_error",
+                            ]
+                        )
                 return [
                     PluginResponse.ok(text=("Sub2API 监控快照已重置；下一次轮询只建立新快照，" "不发送历史变化。"))
                 ]
@@ -241,6 +257,14 @@ class Sub2APIMonitorPlugin(PluginBase):
         async with self._poll_lock:
             self._validate_config()
             result = PollResult()
+            store = self.get_data_store()
+            load_error = getattr(store, "load_error", None)
+            if load_error:
+                result.errors.append(str(load_error))
+                return result
+
+            attempt_at = int(time.time())
+            store.update({"last_poll_attempt_at": attempt_at, "last_poll_error": ""})
             client = await self._get_client()
             poll_values: tuple[Any, Any] = await asyncio.gather(
                 client.fetch_subscriptions(),
@@ -260,7 +284,18 @@ class Sub2APIMonitorPlugin(PluginBase):
                 result,
                 notify=notify,
             )
-            self.get_data_store().set("last_poll_at", int(time.time()))
+            if result.errors:
+                store.update({"last_poll_error": ";".join(result.errors)[:1000]})
+                return result
+
+            success_at = int(time.time())
+            store.update(
+                {
+                    "last_poll_at": success_at,
+                    "last_poll_success_at": success_at,
+                    "last_poll_error": "",
+                }
+            )
             return result
 
     async def _process_poll_value(
@@ -292,13 +327,24 @@ class Sub2APIMonitorPlugin(PluginBase):
         notify: bool,
     ) -> None:
         store = self.get_data_store()
+        load_error = getattr(store, "load_error", None)
+        if load_error:
+            raise Sub2APIError(str(load_error))
+
         source = self._source_fingerprint(name)
         stored_source = store.get(f"{name}_source")
         old_raw = store.get(f"{name}_snapshot")
         old = old_raw if isinstance(old_raw, list) and stored_source == source else None
+        ack_state = self._load_notification_acks(store)
         if old is None:
-            store.set(f"{name}_snapshot", current)
-            store.set(f"{name}_source", source)
+            self._discard_collection_acks(ack_state, name)
+            store.update(
+                {
+                    f"{name}_snapshot": current,
+                    f"{name}_source": source,
+                    "notification_acks": ack_state,
+                }
+            )
             result.initialized.append(name)
             return
 
@@ -314,19 +360,44 @@ class Sub2APIMonitorPlugin(PluginBase):
         )
         events = self._collection_events(name, added, removed, changed)
         self._add_change_counts(name, added, removed, changed, result)
-        if notify and events and not self._notify_groups():
+        groups = self._notify_groups()
+        if notify and events and not groups:
             result.errors.append("未配置通知群，变化快照暂不提交")
             return
 
         sent = 0
+        notification_errors: list[str] = []
         if notify:
             for event_type, before, after in events:
-                sent += await self._notify_change(event_type, before, after)
+                event_key = self._notification_event_key(
+                    name, source, event_type, before, after
+                )
+                event_sent, failures = await self._notify_change(
+                    name,
+                    event_type,
+                    before,
+                    after,
+                    event_key,
+                    ack_state,
+                )
+                sent += event_sent
+                if failures:
+                    notification_errors.append(
+                        f"{event_type} 未确认群组：{', '.join(failures)}"
+                    )
+        if notification_errors:
+            result.errors.extend(notification_errors)
+            result.notifications_sent += sent
+            return
 
-        # Commit only after notifications complete. A delivery failure retries the
-        # same snapshot delta on the next poll instead of silently losing it.
-        store.set(f"{name}_snapshot", current)
-        store.set(f"{name}_source", source)
+        self._discard_collection_acks(ack_state, name)
+        store.update(
+            {
+                f"{name}_snapshot": current,
+                f"{name}_source": source,
+                "notification_acks": ack_state,
+            }
+        )
         result.notifications_sent += sent
 
     @staticmethod
@@ -368,39 +439,104 @@ class Sub2APIMonitorPlugin(PluginBase):
             + [("rate_changed", change.before, change.after) for change in changed]
         )
 
-    async def _notify_change(
-        self,
+    @staticmethod
+    def _notification_event_key(
+        name: str,
+        source: str,
         event_type: str,
         before: dict[str, Any] | None,
         after: dict[str, Any] | None,
-    ) -> int:
+    ) -> str:
+        ignored_keys = (
+            {"group_name", "name", "platform", "slug"}
+            if name == "group_rates"
+            else None
+        )
+        fingerprint = canonical_record(
+            {
+                "name": name,
+                "source": source,
+                "event_type": event_type,
+                "before": comparison_record(before or {}, ignored_keys=ignored_keys),
+                "after": comparison_record(after or {}, ignored_keys=ignored_keys),
+            }
+        )
+        digest = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:24]
+        return f"{name}:{source}:{event_type}:{digest}"
+
+    @staticmethod
+    def _load_notification_acks(store: Any) -> dict[str, list[str]]:
+        raw = store.get("notification_acks", {})
+        if not isinstance(raw, dict):
+            return {}
+        result: dict[str, list[str]] = {}
+        for event_key, group_ids in raw.items():
+            if not isinstance(event_key, str) or not isinstance(group_ids, list):
+                continue
+            cleaned = list(
+                dict.fromkeys(
+                    str(group_id).strip()
+                    for group_id in group_ids
+                    if str(group_id).strip()
+                )
+            )
+            if cleaned:
+                result[event_key] = cleaned
+        return result
+
+    @staticmethod
+    def _discard_collection_acks(ack_state: dict[str, list[str]], name: str) -> None:
+        prefix = f"{name}:"
+        for event_key in list(ack_state):
+            if event_key.startswith(prefix):
+                del ack_state[event_key]
+
+    async def _notify_change(
+        self,
+        name: str,
+        event_type: str,
+        before: dict[str, Any] | None,
+        after: dict[str, Any] | None,
+        event_key: str,
+        ack_state: dict[str, list[str]],
+    ) -> tuple[int, list[str]]:
         groups = self._notify_groups()
         if not groups:
-            return 0
+            return 0, []
         text = _format_change(event_type, before, after)
-        record = after or before or {}
-        fingerprint = (
-            f"{event_type}:"
-            f"{canonical_record(before or {})}:"
-            f"{canonical_record(after or {})}"
-        )
-        digest = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:12]
+        acknowledged = set(ack_state.get(event_key, []))
         sent = 0
+        failures: list[str] = []
+        adapter_type = self._config_value(
+            "adapter_type",
+            default="napcat",
+            allow_empty=True,
+        )
         for group_id in groups:
-            await self.ctx.dispatch_proactive_message(
-                group_id=group_id,
-                text=text,
-                adapter_type=self._config_value(
-                    "adapter_type",
-                    default="napcat",
-                    allow_empty=True,
-                ),
-                event_id=(
-                    f"sub2api:{event_type}:{group_id}:{record.get('id', '')}:{digest}"
-                ),
-            )
-            sent += 1
-        return sent
+            if group_id in acknowledged:
+                continue
+            try:
+                accepted = await self.ctx.dispatch_proactive_message(
+                    group_id=group_id,
+                    text=text,
+                    adapter_type=adapter_type,
+                    event_id=f"sub2api:{event_key}:{group_id}",
+                )
+                if accepted is False:
+                    failures.append(f"{group_id}（投递未确认）")
+                    continue
+                acknowledged.add(group_id)
+                ack_state[event_key] = sorted(acknowledged)
+                self.get_data_store().update({"notification_acks": ack_state})
+                sent += 1
+            except Exception as exc:  # noqa: BLE001 - one group must not block others
+                acknowledged.discard(group_id)
+                if acknowledged:
+                    ack_state[event_key] = sorted(acknowledged)
+                else:
+                    ack_state.pop(event_key, None)
+                failures.append(f"{group_id}（{self._safe_error(exc)}）")
+        return sent, failures
 
     async def _fetch_one(self, name: str) -> list[dict[str, Any]]:
         async with self._poll_lock:
@@ -460,8 +596,8 @@ class Sub2APIMonitorPlugin(PluginBase):
             ),
             "subscriptions_path": self._config_value("subscriptions_path"),
             "group_rates_path": self._config_value("group_rates_path"),
-            "email": self._config_value("email") or os.getenv("SUB2API_EMAIL", "").strip(),
-            "password": self._config_secret("password", "SUB2API_PASSWORD"),
+            "email": os.getenv("SUB2API_EMAIL", "").strip(),
+            "password": os.getenv("SUB2API_PASSWORD", "").strip(),
             "timezone": self._config_value(
                 "timezone", default="Asia/Shanghai", allow_empty=True
             ),
@@ -472,6 +608,26 @@ class Sub2APIMonitorPlugin(PluginBase):
     def _client_config_fingerprint(self) -> str:
         values = self._client_kwargs()
         password = str(values.pop("password", ""))
+        try:
+            client = Sub2APIClient(**values, password=password)
+            resolved_login = client.resolve_url(client.login_path)
+            parsed_login = urlsplit(resolved_login)
+            values["base_url"] = f"{parsed_login.scheme}://{parsed_login.netloc}"
+            for key in (
+                "login_path",
+                "refresh_path",
+                "logout_path",
+                "subscriptions_path",
+                "group_rates_path",
+            ):
+                endpoint = str(values.get(key, ""))
+                values[key] = client.resolve_url(endpoint) if endpoint else ""
+            values["api_base_path"] = ""
+        except Sub2APIError:
+            # Validation reports the user-facing configuration error; retaining
+            # raw values here merely ensures a subsequent valid edit recreates
+            # the client rather than reusing stale transport settings.
+            pass
         values["password_digest"] = hashlib.sha256(password.encode("utf-8")).hexdigest()
         serialized = json.dumps(values, ensure_ascii=False, sort_keys=True, default=str)
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
@@ -480,18 +636,13 @@ class Sub2APIMonitorPlugin(PluginBase):
         endpoint_key = (
             "subscriptions_path" if name == "subscriptions" else "group_rates_path"
         )
+        client = Sub2APIClient(**self._client_kwargs())
+        endpoint = client.resolve_url(getattr(client, endpoint_key))
+        account = os.getenv("SUB2API_EMAIL", "").strip()
         source = {
-            "base_url": self._config_value("base_url"),
-            "api_base_path": self._config_value("api_base_path", default="/api/v1"),
-            "endpoint": self._config_value(endpoint_key),
-            "account": (
-                self._config_value("email") or os.getenv("SUB2API_EMAIL", "").strip()
-            ),
-            "timezone": self._config_value(
-                "timezone",
-                default="Asia/Shanghai",
-                allow_empty=True,
-            ),
+            "endpoint": endpoint,
+            "account_digest": hashlib.sha256(account.encode("utf-8")).hexdigest(),
+            "timezone": client.timezone,
         }
         serialized = json.dumps(source, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
@@ -501,9 +652,9 @@ class Sub2APIMonitorPlugin(PluginBase):
             self._validate_config()
         except Sub2APIError:
             return False
-        credentials_ready = bool(
-            self._config_value("email") or os.getenv("SUB2API_EMAIL", "").strip()
-        ) and bool(self._config_secret("password", "SUB2API_PASSWORD"))
+        credentials_ready = bool(os.getenv("SUB2API_EMAIL", "").strip()) and bool(
+            os.getenv("SUB2API_PASSWORD", "").strip()
+        )
         return credentials_ready and bool(self._notify_groups())
 
     def _validate_config(self) -> None:
@@ -518,6 +669,15 @@ class Sub2APIMonitorPlugin(PluginBase):
         ]
         if missing:
             raise Sub2APIError(f"缺少配置：{', '.join(missing)}")
+
+        legacy_credentials = [
+            key for key in ("email", "password") if self._legacy_credential(key)
+        ]
+        if legacy_credentials:
+            names = "、".join(legacy_credentials)
+            raise Sub2APIError(
+                f"{names} 不支持写入插件设置；请改用 SUB2API_EMAIL 和 SUB2API_PASSWORD 环境变量"
+            )
 
         poll_seconds = self._poll_seconds()
         if not math.isfinite(poll_seconds) or not 30.0 <= poll_seconds <= 86400.0:
@@ -559,6 +719,9 @@ class Sub2APIMonitorPlugin(PluginBase):
         subscriptions = store.get("subscriptions_snapshot")
         rates = store.get("group_rates_snapshot")
         last_poll = store.get("last_poll_at")
+        last_attempt = store.get("last_poll_attempt_at")
+        last_success = store.get("last_poll_success_at")
+        last_error = store.get("last_poll_error")
         required = (
             self._config_value("base_url"),
             self._config_value("subscriptions_path"),
@@ -571,14 +734,16 @@ class Sub2APIMonitorPlugin(PluginBase):
             f"分组倍率快照 {len(rates) if isinstance(rates, list) else 0} 条；"
             f"通知群 {len(self._notify_groups())} 个；"
             f"后台轮询 {self._background_status()}；"
-            f"上次轮询 {last_poll or '尚未执行'}。"
+            f"上次尝试 {last_attempt or '尚未执行'}；"
+            f"上次成功 {last_success or last_poll or '尚未成功'}。"
+            f"{f'当前错误 {last_error}。' if last_error else ''}"
         )
 
     def _safe_error(self, exc: BaseException) -> str:
         text = str(exc) or type(exc).__name__
         secrets = (
-            self._config_secret("password", "SUB2API_PASSWORD"),
-            self._config_value("email"),
+            self._legacy_credential("password"),
+            self._legacy_credential("email"),
             os.getenv("SUB2API_PASSWORD", ""),
             os.getenv("SUB2API_EMAIL", ""),
         )
@@ -609,33 +774,48 @@ class Sub2APIMonitorPlugin(PluginBase):
         text = str(value).strip()
         return text if text or allow_empty else default
 
-    def _config_secret(self, key: str, environment_name: str) -> str:
-        value = self.ctx.config.get(key)
-        if value not in (None, ""):
-            return str(value)
-        return os.getenv(environment_name, "")
+    def _legacy_credential(self, key: str) -> str:
+        """Return a stored credential solely to reject and redact legacy settings."""
+        try:
+            value = self.ctx.config.get(key, "")
+        except RuntimeError:
+            return ""
+        return "" if value is None else str(value).strip()
 
     def _config_float(self, key: str, default: float) -> float:
         try:
-            return float(self._config_value(key, default=str(default)))
-        except (TypeError, ValueError):
-            return default
+            raw = self.ctx.config.get(key, default)
+        except RuntimeError:
+            raw = default
+        try:
+            return float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return float("nan")
 
     def _config_bool(self, key: str, default: bool) -> bool:
-        value = self.ctx.config.get(key, default)
+        try:
+            value = self.ctx.config.get(key, default)
+        except RuntimeError:
+            value = default
         if isinstance(value, bool):
             return value
         return str(value).strip().casefold() in {"1", "true", "yes", "on", "是", "开"}
 
     def _poll_seconds(self) -> float:
         try:
-            value = float(self._config_value("poll_seconds", default="300"))
-        except (TypeError, ValueError):
-            return 300.0
-        return value if math.isfinite(value) else value
+            raw = self.ctx.config.get("poll_seconds", 300)
+        except RuntimeError:
+            raw = 300
+        try:
+            return float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return float("nan")
 
     def _notify_groups(self) -> list[str]:
-        raw: Any = self.ctx.config.get("notify_group_ids", [])
+        try:
+            raw: Any = self.ctx.config.get("notify_group_ids", [])
+        except RuntimeError:
+            raw = []
         if isinstance(raw, str):
             values = raw.replace("，", ",").split(",")
         elif isinstance(raw, list):

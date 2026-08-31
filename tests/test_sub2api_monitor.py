@@ -19,6 +19,11 @@ from sub2api_monitor import (  # noqa: E402
     normalize_group_rates,
     normalize_subscriptions,
 )
+from sub2api_monitor.data import (  # noqa: E402
+    DataNormalizationError,
+    diff_records,
+    redact,
+)
 
 from sirius_pulse.plugins.context import PluginDataStore  # noqa: E402
 from sirius_pulse.plugins.loader import PluginLoader  # noqa: E402
@@ -40,6 +45,11 @@ def test_plugin_loader_discovers_metadata_and_runtime_class():
         "group_rates_path",
         "notify_group_ids",
     }
+    parameters = {parameter.name: parameter for parameter in definition.parameters}
+    assert parameters["poll_seconds"].minimum == 30
+    assert parameters["poll_seconds"].maximum == 86400
+    assert parameters["timeout"].minimum == 1
+    assert parameters["timeout"].maximum == 300
     assert plugin_class is not None
     assert plugin_class.__name__ == Sub2APIMonitorPlugin.__name__
     assert plugin_class._plugin_name == "sub2api_monitor"
@@ -360,6 +370,182 @@ def test_normalizers_support_wrapped_and_mapping_payloads_and_redact_secrets():
     ]
 
 
+def _client_for_validation(
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+    **overrides: Any,
+) -> Sub2APIClient:
+    values: dict[str, Any] = {
+        "base_url": "https://station.example/keys",
+        "api_base_path": "/api/v1",
+        "login_path": "auth/login",
+        "refresh_path": "auth/refresh",
+        "logout_path": "auth/logout",
+        "subscriptions_path": "plans",
+        "group_rates_path": "rates",
+        "email": "bot@example.invalid",
+        "password": "test-password",
+        "transport": transport,
+    }
+    values.update(overrides)
+    return Sub2APIClient(**values)
+
+
+@pytest.mark.asyncio
+async def test_client_rejects_failure_envelopes_and_redacts_remote_error_secrets():
+    responses = [
+        httpx.Response(
+            400,
+            json={
+                "message": {
+                    "api_key": "remote-api-key",
+                    "nested": {"access_token": "remote-access-token"},
+                }
+            },
+        ),
+        httpx.Response(
+            200,
+            json={"success": 0, "detail": {"refresh_token": "remote-refresh-token"}},
+        ),
+        httpx.Response(200, json={"code": [], "error": {"token": "remote-token"}}),
+    ]
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return responses.pop(0)
+
+    client = _client_for_validation(transport=httpx.MockTransport(handler))
+    async with client:
+        for forbidden_values in (
+            ("remote-api-key", "remote-access-token"),
+            ("remote-refresh-token",),
+            ("remote-token",),
+        ):
+            with pytest.raises(Sub2APIError) as error:
+                await client._request_json("GET", "plans", authenticated=False)
+            assert all(secret not in str(error.value) for secret in forbidden_values)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("https://host.invalid/path?api_keys=secret&access_tokens=other", "[已隐藏]"),
+        (
+            "https://secret@host.invalid/path?token=secret",
+            "https://host.invalid/path?token=%5B%E5%B7%B2%E9%9A%90%E8%97%8F%5D",
+        ),
+        (" https://[bad/path?token=secret", "[已隐藏的 URL]"),
+        ("https:?token=secret", "[已隐藏的 URL]"),
+        ("http:/path?api_key=secret", "[已隐藏的 URL]"),
+    ],
+)
+def test_redaction_fails_closed_for_secret_urls(value, expected):
+    redacted = redact(value)
+    if expected == "[已隐藏]":
+        assert "secret" not in redacted
+        assert "other" not in redacted
+    else:
+        assert redacted == expected
+
+
+def test_normalization_handles_camel_case_null_wrappers_and_stable_identities():
+    rates = normalize_group_rates(
+        {
+            "data": {
+                "groups": None,
+                "rates": {
+                    "pro": {
+                        "groupId": "pro",
+                        "modelRate": 0.5,
+                        "peak_rate_enabled": True,
+                    }
+                },
+            }
+        }
+    )
+    assert rates == [
+        {
+            "groupId": "pro",
+            "modelRate": 0.5,
+            "peak_rate_enabled": True,
+            "id": "pro",
+            "rate_multiplier": 0.5,
+        }
+    ]
+    assert (
+        normalize_group_rates([{"id": "g", "rate": 1, "rate_multiplier": 2}])[0][
+            "rate_multiplier"
+        ]
+        == 2
+    )
+    with pytest.raises(DataNormalizationError, match="稳定身份"):
+        normalize_subscriptions([{"id": "   "}])
+    with pytest.raises(DataNormalizationError, match="重复"):
+        normalize_group_rates(
+            [{"id": "g", "rate_multiplier": 1}, {"id": "g", "rate": 2}]
+        )
+    with pytest.raises(DataNormalizationError, match="无效"):
+        normalize_group_rates([{"id": "g", "rate_multiplier": 10**1000}])
+
+    _added, _removed, changed = diff_records(
+        [{"id": " g ", "x": 1}], [{"id": "g", "x": 1}]
+    )
+    assert changed == []
+
+
+def test_client_rejects_invalid_url_and_transport_configurations():
+    with pytest.raises(Sub2APIError):
+        _client_for_validation(
+            base_url="https://station.example:0/keys"
+        )._validate_transport_security()
+    with pytest.raises(Sub2APIError, match="目录穿越"):
+        _client_for_validation().resolve_url("%252e%252e/private")
+    with pytest.raises(Sub2APIError, match="api_base_path"):
+        _client_for_validation(api_base_path="//[").resolve_url("plans")
+    with pytest.raises(Sub2APIError, match="timeout"):
+        asyncio.run(_client_for_validation(timeout=0).__aenter__())
+
+    ipv6 = _client_for_validation(base_url="https://[::1]:443/keys")
+    assert (
+        ipv6.resolve_url("https://[::1]/api/v1/plans") == "https://[::1]/api/v1/plans"
+    )
+
+
+def test_source_fingerprint_uses_effective_origin_and_endpoint(tmp_path):
+    plugin = Sub2APIMonitorPlugin()
+    config = {
+        "base_url": "https://station.example/keys",
+        "subscriptions_path": "plans",
+        "group_rates_path": "rates",
+    }
+    plugin._ctx = SimpleNamespace(
+        config=config, data_store=PluginDataStore(tmp_path, "sub2api_monitor")
+    )
+
+    initial = plugin._source_fingerprint("subscriptions")
+    config["base_url"] = "https://station.example/dashboard"
+    assert plugin._source_fingerprint("subscriptions") == initial
+    config["subscriptions_path"] = "other-plans"
+    assert plugin._source_fingerprint("subscriptions") != initial
+
+
+def test_rate_event_key_ignores_display_name_changes():
+    first = Sub2APIMonitorPlugin._notification_event_key(
+        "group_rates",
+        "source",
+        "rate_changed",
+        {"id": "g", "groupName": "旧名", "rate_multiplier": 1},
+        {"id": "g", "groupName": "旧名", "rate_multiplier": 2},
+    )
+    renamed = Sub2APIMonitorPlugin._notification_event_key(
+        "group_rates",
+        "source",
+        "rate_changed",
+        {"id": "g", "groupName": "新名", "rate_multiplier": 1},
+        {"id": "g", "groupName": "新名", "rate_multiplier": 2},
+    )
+    assert first == renamed
+
+
 class _SequenceClient:
     def __init__(
         self,
@@ -488,7 +674,101 @@ async def test_source_change_silently_reinitializes_snapshots(tmp_path):
     assert store.get("subscriptions_snapshot") == [{"id": "new", "name": "新站订阅"}]
 
 
-def test_background_task_requires_credentials_target_and_designated_persona(tmp_path):
+@pytest.mark.asyncio
+async def test_poll_retries_only_unconfirmed_groups_and_commits_atomically(tmp_path):
+    store = PluginDataStore(tmp_path, "sub2api_monitor")
+    plugin = Sub2APIMonitorPlugin()
+    plugin._client = _SequenceClient(
+        subscriptions=[
+            [{"id": "plan", "name": "基础", "price": 10}],
+            [{"id": "plan", "name": "基础", "price": 20}],
+            [{"id": "plan", "name": "基础", "price": 20}],
+        ],
+        rates=[
+            [{"id": "group", "group_name": "一组", "rate_multiplier": 1}],
+            [{"id": "group", "group_name": "一组", "rate_multiplier": 1}],
+            [{"id": "group", "group_name": "一组", "rate_multiplier": 1}],
+        ],
+    )
+    calls: list[str] = []
+    bad_attempts = 0
+    config = {
+        "base_url": "https://station.example/keys",
+        "subscriptions_path": "plans",
+        "group_rates_path": "rates",
+        "notify_group_ids": ["good", "bad"],
+        "run_on_persona": "alice",
+    }
+
+    async def dispatch(**kwargs: Any) -> bool:
+        nonlocal bad_attempts
+        group_id = kwargs["group_id"]
+        calls.append(group_id)
+        if group_id == "bad":
+            bad_attempts += 1
+            return bad_attempts > 1
+        return True
+
+    plugin._ctx = SimpleNamespace(
+        config=config,
+        data_store=store,
+        dispatch_proactive_message=dispatch,
+    )
+
+    await plugin.poll_once()
+    initial_success = store.get("last_poll_success_at")
+    failed = await plugin.poll_once()
+
+    assert failed.errors
+    assert store.get("subscriptions_snapshot") == [
+        {"id": "plan", "name": "基础", "price": 10}
+    ]
+    assert calls == ["good", "bad"]
+    assert store.get("last_poll_success_at") == initial_success
+    assert store.get("last_poll_at") == initial_success
+
+    recovered = await plugin.poll_once()
+    assert not recovered.errors
+    assert calls == ["good", "bad", "bad"]
+    assert store.get("subscriptions_snapshot") == [
+        {"id": "plan", "name": "基础", "price": 20}
+    ]
+    assert store.get("last_poll_success_at") is not None
+
+
+@pytest.mark.asyncio
+async def test_corrupt_store_is_reported_until_reset(tmp_path):
+    store_file = tmp_path / "_plugin_sub2api_monitor_data.json"
+    store_file.write_text("{broken", encoding="utf-8")
+    store = PluginDataStore(tmp_path, "sub2api_monitor")
+    plugin = Sub2APIMonitorPlugin()
+    plugin._client = _SequenceClient(
+        subscriptions=[[{"id": "plan"}]],
+        rates=[[{"id": "group", "rate_multiplier": 1}]],
+    )
+    plugin._ctx = SimpleNamespace(
+        config={
+            "base_url": "https://station.example/keys",
+            "subscriptions_path": "plans",
+            "group_rates_path": "rates",
+            "notify_group_ids": ["10001"],
+        },
+        data_store=store,
+    )
+
+    result = await plugin.poll_once(notify=False)
+    assert result.errors and "损坏" in result.errors[0]
+    assert store.get("subscriptions_snapshot") is None
+    assert store.load_error
+
+    store.clear()
+    assert store.load_error is None
+    assert store.all() == {}
+
+
+def test_background_task_requires_credentials_target_and_designated_persona(
+    tmp_path, monkeypatch
+):
     store = PluginDataStore(tmp_path, "sub2api_monitor")
     plugin = Sub2APIMonitorPlugin()
     persona_name = "alice"
@@ -497,8 +777,6 @@ def test_background_task_requires_credentials_target_and_designated_persona(tmp_
         "base_url": "https://station.example/keys",
         "subscriptions_path": "payment/checkout-info",
         "group_rates_path": "groups/rates",
-        "email": "bot@example.invalid",
-        "password": "test-password",
         "notify_group_ids": [],
         "run_on_persona": "alice",
     }
@@ -506,8 +784,17 @@ def test_background_task_requires_credentials_target_and_designated_persona(tmp_
 
     assert plugin.create_background_tasks() == []
 
+    monkeypatch.setenv("SUB2API_EMAIL", "bot@example.invalid")
+    monkeypatch.setenv("SUB2API_PASSWORD", "test-password")
     config["notify_group_ids"] = ["10001"]
     assert len(plugin.create_background_tasks()) == 1
 
     persona_name = "bob"
+    assert plugin.create_background_tasks() == []
+
+    persona_name = "alice"
+    config["email"] = "legacy@example.invalid"
+    assert plugin.create_background_tasks() == []
+    config.pop("email")
+    config["password"] = "legacy-secret"
     assert plugin.create_background_tasks() == []

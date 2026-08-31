@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -62,6 +61,12 @@ class _MonitorStore:
     def artifact_dir(self) -> Path:
         return self._plugin.get_artifact_dir()
 
+    @property
+    def webhook_state_path(self) -> Path:
+        """Return a private durable inbox snapshot path for this persona."""
+        store_path = self._plugin.get_data_store().store_path
+        return store_path.with_name("_plugin_github_monitor_webhook_state.json")
+
     def reload(self) -> None:
         self._plugin.get_data_store().reload()
 
@@ -75,7 +80,9 @@ class _MonitorStore:
         settings = self._plugin.ctx.config
         stored_data = self._plugin.get_data_store()
         stored = stored_data.get(key, None)
-        value = settings[key] if key in settings and settings[key] is not None else stored
+        value = (
+            settings[key] if key in settings and settings[key] is not None else stored
+        )
         if value is None and key in _CONFIG_DEFAULTS:
             value = _CONFIG_DEFAULTS[key]
         if key == "webhook_secret":
@@ -105,7 +112,11 @@ class _MonitorStore:
     def all(self) -> dict[str, Any]:
         data = self._plugin.get_data_store().all()
         data.update(
-            {key: value for key, value in self._plugin.ctx.config.items() if key in _CONFIG_KEYS}
+            {
+                key: value
+                for key, value in self._plugin.ctx.config.items()
+                if key in _CONFIG_KEYS
+            }
         )
         return data
 
@@ -130,13 +141,30 @@ class _MonitorContext:
             return value if isinstance(value, str) else ""
         return ""
 
+    def get_bridge_owner(self) -> str:
+        """Return a stable scope for this persona's bridge registrations."""
+        persona_name = ""
+        getter = getattr(self._plugin.ctx.engine, "get_persona_name", None)
+        if callable(getter):
+            try:
+                persona_name = str(getter() or "").strip()
+            except Exception:
+                persona_name = ""
+        if not persona_name:
+            engine = self._plugin.ctx.engine.get_engine()
+            persona = getattr(engine, "persona", None) if engine is not None else None
+            persona_name = str(getattr(persona, "name", "") or "").strip()
+        return f"{persona_name}:github_monitor" if persona_name else "github_monitor"
+
     def get_persona(self) -> Any:
         engine = self._plugin.ctx.engine.get_engine()
         return getattr(engine, "persona", None) if engine is not None else None
 
     def log_inner_thought(self, text: str) -> None:
         engine = self._plugin.ctx.engine.get_engine()
-        handler = getattr(engine, "_log_inner_thought", None) if engine is not None else None
+        handler = (
+            getattr(engine, "_log_inner_thought", None) if engine is not None else None
+        )
         if callable(handler):
             handler(text)
 
@@ -156,15 +184,17 @@ class _MonitorContext:
             **kwargs,
         )
 
-    def queue_pending_message(self, group_id: str, text: str, adapter_type: str = "") -> None:
+    def queue_pending_message(
+        self, group_id: str, text: str, adapter_type: str = ""
+    ) -> None:
         # The following reminder_triggered event performs the actual queueing.
         return None
 
-    async def emit_event(self, event_type: str, data: dict[str, Any]) -> None:
+    async def emit_event(self, event_type: str, data: dict[str, Any]) -> bool:
         if event_type != "reminder_triggered":
-            await self._plugin.ctx.engine.emit_event(event_type, data)
-            return
-        await self._plugin.ctx.dispatch_proactive_message(
+            result = await self._plugin.ctx.engine.emit_event(event_type, data)
+            return result is not False
+        return await self._plugin.ctx.dispatch_proactive_message(
             group_id=str(data.get("group_id", "")),
             text=str(data.get("reply", "")),
             adapter_type=str(data.get("adapter_type", "") or ""),
@@ -188,7 +218,8 @@ class GitHubMonitorPlugin(PluginBase):
     _plugin_description = "监控 GitHub Issue、PR、Release、Comment 和 Push 动态。"
     _plugin_version = "1.1.0"
     _plugin_author = "Sparrived"
-    _plugin_dependencies = ["httpx>=0.24.0", "playwright>=1.57.0"]
+    _plugin_min_framework_version = "1.3.0"
+    _plugin_dependencies = ["aiohttp>=3.9.0", "httpx>=0.24.0", "playwright>=1.57.0"]
     _plugin_permissions = {
         "hidden_from_intent": True,
         "rate_limit": {"calls_per_minute": 20, "calls_per_hour": 300},
@@ -335,16 +366,25 @@ class GitHubMonitorPlugin(PluginBase):
         return PluginResponse.fail("用法：/github status 或 /github poll")
 
     def _migrate_legacy_store(self) -> None:
-        """Import legacy monitor state, moving credentials to env references.
+        """Import only non-secret legacy state through one atomic store update.
 
-        The migration is deliberately all-or-nothing: a marker is written only
-        after every existing candidate parsed successfully.  Legacy files are
-        retained for user inspection, but credential fields are rewritten in
-        place so a successful migration does not leave another plaintext copy.
+        A legacy credential cannot be safely copied into a process environment
+        or an unknown secret manager from inside the Plugin.  Therefore this
+        migration is deliberately fail-closed: whenever a plaintext GitHub
+        credential still exists on any known persistence surface, it preserves
+        that source unchanged, records a non-secret pending marker, and does
+        *not* claim completion.  Operators must provision an environment/secret
+        reference, rotate the old credential, and remove the plaintext before a
+        subsequent load can finalize the non-secret state migration.
         """
         store = self.get_data_store()
-        if int(store.get("_legacy_migration_version", 0) or 0) >= 1:
+        try:
+            migration_version = int(store.get("_legacy_migration_version", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            migration_version = 0
+        if migration_version >= 1:
             return
+
         plugin_data_dir = store.store_path.parent
         persona_dir = plugin_data_dir.parent
         candidates = [
@@ -354,15 +394,15 @@ class GitHubMonitorPlugin(PluginBase):
         ]
         existing = [path for path in candidates if path.is_file()]
         merged: dict[str, Any] = {}
-        parsed_sources: list[tuple[Path, dict[str, Any]]] = []
+        source_payloads: list[dict[str, Any]] = []
         try:
             for path in existing:
                 raw = json.loads(path.read_text(encoding="utf-8"))
                 if not isinstance(raw, dict):
                     raise ValueError(f"旧配置根值不是对象: {path}")
-                parsed_sources.append((path, raw))
                 payload = self._legacy_payload(raw)
                 if payload:
+                    source_payloads.append(payload)
                     merged.update(payload)
                     logger.info("发现旧 GitHub 监控数据: %s", path)
         except Exception:
@@ -370,61 +410,98 @@ class GitHubMonitorPlugin(PluginBase):
             logger.exception("迁移旧 GitHub 监控数据失败")
             return
 
-        # Remove credentials from every source before acknowledging migration.
-        # A failed rewrite leaves the marker untouched, so the next load can
-        # retry instead of claiming that a plaintext source was handled.
-        merged = self._sanitize_payload(merged)
-        try:
-            from sirius_pulse.config.file_io import atomic_json_save
-
-            for path, raw in parsed_sources:
-                sanitized = self._sanitize_payload_tree(raw)
-                atomic_json_save(path, sanitized)
-        except Exception:
-            logger.warning("清理旧 GitHub 凭据失败，迁移将在下次加载重试", exc_info=True)
+        current = store.all()
+        runtime_settings = self.ctx.config if isinstance(self.ctx.config, dict) else {}
+        source_has_plaintext = any(
+            self._contains_plaintext_secret(payload) for payload in source_payloads
+        )
+        current_has_plaintext = self._contains_plaintext_secret(current)
+        runtime_has_plaintext = self._contains_plaintext_secret(runtime_settings)
+        if source_has_plaintext or current_has_plaintext or runtime_has_plaintext:
+            # Updating a PluginDataStore that already contains a legacy secret
+            # serializes that same secret again.  Do not perform even a marker
+            # write in that case; preserve it untouched for an operator-led,
+            # externally provisioned rotation.
+            if not current_has_plaintext:
+                self._record_pending_credential_migration(store)
+            logger.warning(
+                "检测到旧 GitHub 明文凭据；保留原配置且不标记迁移完成。" "请先在受支持的 Secret 管理器或进程环境中配置引用并轮换旧凭据。"
+            )
             return
 
-        current = store.all()
+        # No source file is rewritten here.  Keeping legacy files intact avoids
+        # a multi-file secret handoff transaction that could otherwise erase the
+        # only usable credential when a later store write fails.
+        merged = self._sanitize_payload(merged)
+        conflicts = sorted(
+            key
+            for key, value in merged.items()
+            if key in current and current[key] != value
+        )
+        if conflicts:
+            logger.warning(
+                "旧 GitHub 监控状态与现有 Plugin 状态冲突；保留现有字段: %s",
+                ", ".join(conflicts),
+            )
         updates = {key: value for key, value in merged.items() if key not in current}
-        # The marker is deliberately part of the final atomic store update.
+        # The marker is deliberately part of the one atomic PluginDataStore
+        # update.  Do not fall back to a sequence of set() calls here.
         updates["_legacy_migration_version"] = 1
+        updates["_legacy_migration_pending"] = ""
         update = getattr(store, "update", None)
-        if callable(update):
+        if not callable(update):
+            logger.error("PluginDataStore 不支持原子 update，拒绝标记旧配置迁移完成")
+            return
+        try:
             update(updates)
-        else:
-            for key, value in updates.items():
-                store.set(key, value)
+        except Exception:
+            logger.warning("写入 GitHub 监控迁移状态失败，将在下次加载重试", exc_info=True)
 
     @staticmethod
-    def _environment_name(kind: str, owner: str = "", repo: str = "") -> str:
-        suffix = re.sub(r"[^A-Za-z0-9]+", "_", f"{owner}_{repo}").strip("_").upper()
-        if suffix:
-            # Include a stable digest so punctuation variants cannot make two
-            # repositories share one secret variable accidentally.
-            identity = f"{owner}/{repo}".encode("utf-8", errors="ignore")
-            suffix = f"{suffix}_{hashlib.sha256(identity).hexdigest()[:10].upper()}"
-        return f"SIRIUS_GITHUB_{kind.upper()}_{suffix}" if suffix else f"SIRIUS_GITHUB_{kind.upper()}"
+    def _contains_plaintext_secret(value: Any) -> bool:
+        """Detect legacy GitHub credential fields without logging their values."""
+        if isinstance(value, list):
+            return any(
+                GitHubMonitorPlugin._contains_plaintext_secret(item) for item in value
+            )
+        if not isinstance(value, dict):
+            return False
+        for raw_key, item in value.items():
+            key = str(raw_key).strip().casefold()
+            if key in {"github_token", "webhook_secret"}:
+                if not isinstance(item, str):
+                    if item:
+                        return True
+                elif item.strip() and item.strip() not in _MASKED_SECRETS:
+                    return True
+            if GitHubMonitorPlugin._contains_plaintext_secret(item):
+                return True
+        return False
+
+    @staticmethod
+    def _record_pending_credential_migration(store: Any) -> None:
+        """Persist a non-secret marker while retaining the usable old source."""
+        update = getattr(store, "update", None)
+        if not callable(update):
+            logger.error("PluginDataStore 不支持原子 update，无法记录凭据迁移待处理状态")
+            return
+        try:
+            update({"_legacy_migration_pending": "credential_handoff_required"})
+        except Exception:
+            logger.warning("记录 GitHub 凭据迁移待处理状态失败", exc_info=True)
 
     @classmethod
     def _sanitize_repo(cls, value: Any) -> dict[str, Any]:
+        """Normalize only non-secret repository fields during migration.
+
+        This helper deliberately never converts, copies, or clears a credential.
+        The caller must first prove no plaintext credential exists anywhere in
+        the migration surfaces; environmental values are never read here.
+        """
         if not isinstance(value, dict):
             return {}
         result = dict(value)
-        owner = str(result.get("owner", "")).strip()
-        repo = str(result.get("repo", "")).strip()
-        token = str(result.get("github_token", "") or "").strip()
         token_env = str(result.get("github_token_env", "") or "").strip()
-        if token and token not in _MASKED_SECRETS:
-            token_env = (
-                token_env
-                if _ENV_NAME_PATTERN.fullmatch(token_env)
-                else cls._environment_name("TOKEN", owner, repo)
-            )
-            # Never copy a legacy credential into os.environ: the worker
-            # environment can be inspected by diagnostics or child processes.
-            # Operators must provision the generated variable out-of-band.
-        if "github_token" in result:
-            result["github_token"] = ""
         if token_env and _ENV_NAME_PATTERN.fullmatch(token_env):
             result["github_token_env"] = token_env
         elif "github_token_env" in result:
@@ -433,6 +510,7 @@ class GitHubMonitorPlugin(PluginBase):
 
     @classmethod
     def _sanitize_payload(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        """Normalize non-secret legacy state after the fail-closed credential scan."""
         result = dict(payload)
         nested_config = result.get("config")
         if isinstance(nested_config, dict):
@@ -440,20 +518,7 @@ class GitHubMonitorPlugin(PluginBase):
         repos = result.get("repos")
         if isinstance(repos, list):
             result["repos"] = [cls._sanitize_repo(item) for item in repos]
-        secret = str(result.get("webhook_secret", "") or "").strip()
         secret_env = str(result.get("webhook_secret_env", "") or "").strip()
-        if secret and secret not in _MASKED_SECRETS:
-            secret_env = (
-                secret_env
-                if _ENV_NAME_PATTERN.fullmatch(secret_env)
-                else cls._environment_name("WEBHOOK_SECRET")
-            )
-            # Do not place a legacy secret in the worker environment.  The
-            # generated reference is only useful after the operator provisions
-            # it in the process supervisor/secret manager.
-            result["webhook_secret"] = ""
-        elif "webhook_secret" in result:
-            result["webhook_secret"] = ""
         if secret_env and _ENV_NAME_PATTERN.fullmatch(secret_env):
             result["webhook_secret_env"] = secret_env
         elif "webhook_secret_env" in result:
@@ -468,7 +533,9 @@ class GitHubMonitorPlugin(PluginBase):
             return [cls._sanitize_payload_tree(item) for item in value]
         if not isinstance(value, dict):
             return value
-        result = {str(key): cls._sanitize_payload_tree(item) for key, item in value.items()}
+        result = {
+            str(key): cls._sanitize_payload_tree(item) for key, item in value.items()
+        }
         for key in ("github_monitor", "config"):
             nested = result.get(key)
             if isinstance(nested, dict):
@@ -499,7 +566,9 @@ class GitHubMonitorPlugin(PluginBase):
             # {"github_monitor": {"config": {...}, "enabled": ...}}.
             if isinstance(direct.get("config"), dict):
                 nested = GitHubMonitorPlugin._legacy_payload(direct["config"])
-                nested.update({key: value for key, value in direct.items() if key != "config"})
+                nested.update(
+                    {key: value for key, value in direct.items() if key != "config"}
+                )
                 return nested
             return direct
         for key in ("github_monitor", "skills", "plugins", "config"):

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import re
@@ -24,18 +23,39 @@ _COLLECTION_KEYS = {
     "subscriptions": ("plans", "subscriptions", "items", "products"),
     "group_rates": ("groups", "rates", "items"),
 }
-_RATE_FIELDS = {
-    "value",
-    "ratio",
-    "weight",
-    "rate",
-    "multiplier",
+_RATE_FIELDS = (
     "rate_multiplier",
+    "multiplier",
     "model_ratio",
     "completion_ratio",
     "input_ratio",
     "output_ratio",
-}
+    "ratio",
+    "weight",
+    "rate",
+    "value",
+)
+_SECRET_SUFFIXES = (
+    "_token",
+    "_tokens",
+    "_key",
+    "_keys",
+    "_secret",
+    "_secrets",
+    "_password",
+    "_passwords",
+)
+_RATE_EXCLUDED_MARKERS = (
+    "limit",
+    "quota",
+    "capacity",
+    "concurr",
+    "rpm",
+    "tpm",
+    "rpd",
+    "tpd",
+)
+_RATE_BOOLEAN_FIELDS = {"peak_rate_enabled"}
 
 
 class DataNormalizationError(ValueError):
@@ -119,9 +139,11 @@ def normalize_group_rates(payload: Any) -> list[dict[str, Any]]:
             for record_id, value in data.items():
                 if isinstance(value, dict):
                     record = dict(value)
-                    if record.get("id") in (None, ""):
+                    if _normalized_identity(record.get("id")) is None:
                         record["id"] = record_id
-                elif isinstance(value, (int, float, str)) and not isinstance(value, bool):
+                elif isinstance(value, (int, float, str)) and not isinstance(
+                    value, bool
+                ):
                     record = {"id": record_id, "rate_multiplier": value}
                 else:
                     raise DataNormalizationError("分组倍率映射包含非法记录")
@@ -157,8 +179,8 @@ def diff_records(
 def _index_records(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     indexed: dict[str, dict[str, Any]] = {}
     for item in records:
-        identity = str(item.get("id", "")).strip()
-        if not identity:
+        identity = _normalized_identity(item.get("id"))
+        if identity is None:
             raise DataNormalizationError("快照记录缺少身份字段")
         if identity in indexed:
             raise DataNormalizationError(f"快照包含重复记录身份: {identity}")
@@ -199,7 +221,7 @@ def _extract_records(
                         **item,
                         "id": (
                             item.get("id")
-                            if item.get("id") not in (None, "")
+                            if _normalized_identity(item.get("id")) is not None
                             else record_id
                         ),
                     }
@@ -207,9 +229,7 @@ def _extract_records(
                     else (
                         {"id": record_id, "value": item}
                         if allow_scalar_map_values
-                        else (_ for _ in ()).throw(
-                            DataNormalizationError("响应映射包含非法记录")
-                        )
+                        else (_ for _ in ()).throw(DataNormalizationError("响应映射包含非法记录"))
                     )
                 )
                 for record_id, item in value.items()
@@ -260,24 +280,33 @@ def _project_group_rate(item: dict[str, Any]) -> dict[str, Any]:
     return {key: item[key] for key in item if key in selected}
 
 
-def _is_group_rate_field(key: str) -> bool:
+def is_group_rate_field(key: Any) -> bool:
+    """Return whether a field is a numeric multiplier accepted by snapshots."""
     normalized = _normalize_field_name(key)
-    excluded_markers = (
-        "limit",
-        "quota",
-        "capacity",
-        "concurr",
-        "rpm",
-        "tpm",
-        "rpd",
-        "tpd",
-    )
-    if any(marker in normalized for marker in excluded_markers):
+    if normalized in _RATE_BOOLEAN_FIELDS:
         return False
-    return any(
-        marker in normalized
-        for marker in ("ratio", "multiplier", "rate", "weight")
-    ) or normalized in {"peak_start", "peak_end", "peak_rate_enabled"}
+    if any(marker in normalized for marker in _RATE_EXCLUDED_MARKERS):
+        return False
+    return normalized in _RATE_FIELDS or any(
+        marker in normalized for marker in ("ratio", "multiplier", "rate", "weight")
+    )
+
+
+def _is_group_rate_field(key: Any) -> bool:
+    """Return whether a field is relevant to a group-rate snapshot."""
+    normalized = _normalize_field_name(key)
+    return is_group_rate_field(normalized) or normalized in {
+        "peak_start",
+        "peak_end",
+        "peak_rate_enabled",
+    }
+
+
+def _normalized_identity(value: Any) -> str | None:
+    if value is None:
+        return None
+    identity = str(value).strip()
+    return identity if identity and identity != "[已隐藏]" else None
 
 
 def _record_identity(item: dict[str, Any], *, kind: str) -> str | None:
@@ -306,16 +335,16 @@ def _record_identity(item: dict[str, Any], *, kind: str) -> str | None:
             "slug",
         )
     for key in candidates:
-        value = item.get(key)
-        if value not in (None, "", "[已隐藏]"):
-            return str(value).strip()
+        identity = _normalized_identity(item.get(key))
+        if identity is not None:
+            return identity
     return None
 
 
 def _normalize_rate_fields(item: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(item)
     for key, value in list(normalized.items()):
-        if _normalize_field_name(key) not in _RATE_FIELDS:
+        if not is_group_rate_field(key):
             continue
         if not _finite_number(value):
             raise DataNormalizationError(f"分组倍率字段无效: {key}")
@@ -324,14 +353,29 @@ def _normalize_rate_fields(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def _has_rate_field(item: dict[str, Any]) -> bool:
-    return any(_normalize_field_name(key) in _RATE_FIELDS for key in item)
+    return any(is_group_rate_field(key) for key in item)
 
 
 def _rate_value(item: dict[str, Any]) -> float:
-    for key, value in item.items():
-        if _normalize_field_name(key) in _RATE_FIELDS:
-            return float(value)
+    candidates = sorted(
+        (
+            (_rate_field_priority(key), _normalize_field_name(key), str(key), value)
+            for key, value in item.items()
+            if is_group_rate_field(key)
+        ),
+        key=lambda value: value[:3],
+    )
+    if candidates:
+        return float(candidates[0][3])
     raise DataNormalizationError("分组倍率记录缺少有效倍率")
+
+
+def _rate_field_priority(key: Any) -> int:
+    normalized = _normalize_field_name(key)
+    try:
+        return _RATE_FIELDS.index(normalized)
+    except ValueError:
+        return len(_RATE_FIELDS)
 
 
 def _finite_number(value: Any) -> bool:
@@ -339,7 +383,7 @@ def _finite_number(value: Any) -> bool:
         return False
     try:
         return math.isfinite(float(value))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return False
 
 
@@ -359,30 +403,26 @@ def _first_non_empty(mapping: Any, *keys: str) -> Any:
     return None
 
 
-def _normalize_field_name(field_name: str) -> str:
-    camel_case = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", field_name)
+def _normalize_field_name(field_name: Any) -> str:
+    text = str(field_name)
+    camel_case = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", text)
     return re.sub(r"[^a-z0-9]+", "_", camel_case.casefold()).strip("_")
 
 
 def redact(value: Any, *, field_name: str = "") -> Any:
     """Recursively remove token/password-like fields before persistence/output."""
     normalized = _normalize_field_name(field_name)
-    secret_suffixes = (
-        "_token",
-        "_tokens",
-        "_key",
-        "_keys",
-        "_secret",
-        "_secrets",
-        "_password",
-        "_passwords",
-    )
-    if normalized in _SECRET_KEYS or normalized in {
-        "keys",
-        "tokens",
-        "secrets",
-        "passwords",
-    } or normalized.endswith(secret_suffixes):
+    if (
+        normalized in _SECRET_KEYS
+        or normalized
+        in {
+            "keys",
+            "tokens",
+            "secrets",
+            "passwords",
+        }
+        or normalized.endswith(_SECRET_SUFFIXES)
+    ):
         return "[已隐藏]"
     if isinstance(value, dict):
         return {
@@ -397,34 +437,68 @@ def redact(value: Any, *, field_name: str = "") -> Any:
 
 def _is_secret_query_key(key: str) -> bool:
     normalized = _normalize_field_name(key)
-    return normalized in _SECRET_KEYS or normalized in {
-        "keys",
-        "tokens",
-        "secrets",
-        "passwords",
-    } or normalized.endswith(("_token", "_key", "_secret", "_password"))
+    return (
+        normalized in _SECRET_KEYS
+        or normalized
+        in {
+            "keys",
+            "tokens",
+            "secrets",
+            "passwords",
+        }
+        or normalized.endswith(_SECRET_SUFFIXES)
+    )
 
 
 def _redact_url(value: str) -> str:
     try:
         parsed = urlsplit(value)
+        port = parsed.port
     except ValueError:
+        return (
+            "[已隐藏的 URL]"
+            if value.lstrip().casefold().startswith(("http://", "https://"))
+            else value
+        )
+    if parsed.scheme.casefold() not in {"http", "https"}:
         return value
-    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
-        return value
+    if not parsed.netloc:
+        return "[已隐藏的 URL]"
     query = parse_qsl(parsed.query, keep_blank_values=True)
     safe_query = [
-        (key, "[已隐藏]" if _is_secret_query_key(key) else item)
-        for key, item in query
+        (key, "[已隐藏]" if _is_secret_query_key(key) else item) for key, item in query
     ]
-    netloc = parsed.hostname or ""
-    if parsed.port:
-        netloc += f":{parsed.port}"
-    if parsed.username:
-        netloc = f"{parsed.username}:***@{netloc}"
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = host
+    if port is not None:
+        netloc += f":{port}"
     return urlunsplit(
-        (parsed.scheme, netloc, parsed.path, urlencode(safe_query), "[已隐藏]" if parsed.fragment else "")
+        (
+            parsed.scheme,
+            netloc,
+            parsed.path,
+            urlencode(safe_query),
+            "[已隐藏]" if parsed.fragment else "",
+        )
     )
+
+
+def comparison_record(
+    record: dict[str, Any], *, ignored_keys: set[str] | None = None
+) -> dict[str, Any]:
+    """Project a record into the stable representation used for comparisons."""
+    ignored = {_normalize_field_name(key) for key in (ignored_keys or set())}
+    comparable = {
+        key: value
+        for key, value in record.items()
+        if _normalize_field_name(key) not in ignored
+    }
+    identity = _normalized_identity(record.get("id"))
+    if identity is not None:
+        comparable["id"] = identity
+    return comparable
 
 
 def _canonical_records(
@@ -432,10 +506,12 @@ def _canonical_records(
     *,
     ignored_keys: set[str] | None,
 ) -> dict[str, str]:
-    ignored = ignored_keys or set()
-    return {
-        str(item.get("id", "")): canonical_record(
-            {key: value for key, value in item.items() if key not in ignored}
+    result: dict[str, str] = {}
+    for item in records:
+        identity = _normalized_identity(item.get("id"))
+        if identity is None:
+            raise DataNormalizationError("快照记录缺少身份字段")
+        result[identity] = canonical_record(
+            comparison_record(item, ignored_keys=ignored_keys)
         )
-        for item in records
-    }
+    return result

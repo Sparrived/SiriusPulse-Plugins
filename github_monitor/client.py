@@ -1,8 +1,10 @@
-"""GitHub REST client used by the external monitor plugin."""
+"""GitHub REST client with constrained, DNS-checked API egress."""
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
+import socket
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -11,9 +13,118 @@ import httpx
 _GITHUB_API_BASE = "https://api.github.com"
 _DEFAULT_TIMEOUT = 30.0
 _DEFAULT_ALLOWED_HOSTS = frozenset({"api.github.com"})
+# Cloud metadata endpoints are rejected explicitly even where an address is
+# represented differently by a platform resolver.  The broader address
+# predicates below reject the private/link-local ranges that contain most of
+# these endpoints as well.
+_METADATA_NETWORKS = (
+    ipaddress.ip_network("169.254.169.254/32"),  # AWS/GCP/Azure IMDS
+    ipaddress.ip_network("169.254.170.2/32"),  # AWS ECS task metadata
+    ipaddress.ip_network("100.100.100.0/24"),  # Alibaba Cloud metadata
+    ipaddress.ip_network("168.63.129.16/32"),  # Azure WireServer
+    ipaddress.ip_network("192.0.0.192/32"),  # cloud metadata compatibility endpoint
+    ipaddress.ip_network("fd00:ec2::254/128"),  # AWS IMDS IPv6
+)
+_METADATA_HOSTNAMES = frozenset(
+    {
+        "metadata.google.internal",
+        "metadata.google",
+        "instance-data.ec2.internal",
+    }
+)
+
+IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
 
 
-def github_headers(token: str = "", *, extra_accept: str | None = None) -> dict[str, str]:
+def _is_safe_ip_address(value: str | IPAddress) -> bool:
+    """Return whether an address is globally routable and not metadata.
+
+    IPv4-mapped IPv6 values are checked as their embedded IPv4 address.  This
+    prevents a non-public IPv4 endpoint from being hidden behind an IPv6 spelling.
+    """
+    try:
+        address = (
+            value
+            if isinstance(value, (ipaddress.IPv4Address, ipaddress.IPv6Address))
+            else ipaddress.ip_address(value)
+        )
+    except (TypeError, ValueError):
+        return False
+
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        address = mapped
+
+    if (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_reserved
+        or address.is_multicast
+        or address.is_unspecified
+        or not address.is_global
+    ):
+        return False
+    return not any(address in network for network in _METADATA_NETWORKS)
+
+
+async def _resolve_public_addresses(
+    host: str, *, port: int = 443
+) -> tuple[IPAddress, ...]:
+    """Resolve every A/AAAA record and reject unsafe destinations.
+
+    This asynchronous preflight is intentionally not presented as complete
+    connection-level DNS pinning: the hostname can still change between this
+    lookup and the socket connect (DNS TOCTOU).  Production deployments need an
+    egress firewall to enforce the same public-destination policy at connect
+    time.
+    """
+    normalized_host = str(host or "").strip().casefold().rstrip(".")
+    if not normalized_host:
+        raise ValueError("GitHub API 主机不能为空")
+    if normalized_host in _METADATA_HOSTNAMES:
+        raise ValueError("GitHub API 主机不得使用 metadata 主机名")
+    try:
+        records = await asyncio.to_thread(
+            socket.getaddrinfo,
+            normalized_host,
+            port,
+            family=socket.AF_UNSPEC,
+            type=socket.SOCK_STREAM,
+        )
+    except (OSError, socket.gaierror) as exc:
+        raise ValueError("GitHub API 主机 DNS 解析失败") from exc
+
+    addresses: list[IPAddress] = []
+    seen: set[str] = set()
+    for record in records:
+        try:
+            family = record[0]
+            sockaddr = record[4]
+            address_text = sockaddr[0]
+        except (IndexError, TypeError, KeyError) as exc:
+            raise ValueError("GitHub API 主机 DNS 地址无效") from exc
+        if family not in (socket.AF_INET, socket.AF_INET6):
+            raise ValueError("GitHub API 主机 DNS 返回了非 A/AAAA 地址")
+        try:
+            address = ipaddress.ip_address(str(address_text))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("GitHub API 主机 DNS 地址无效") from exc
+        address_key = str(address)
+        if address_key not in seen:
+            seen.add(address_key)
+            addresses.append(address)
+
+    if not addresses:
+        raise ValueError("GitHub API 主机未解析出 A/AAAA 地址")
+    if any(not _is_safe_ip_address(address) for address in addresses):
+        raise ValueError("GitHub API 主机解析到非公网或 metadata 地址")
+    return tuple(addresses)
+
+
+def github_headers(
+    token: str = "", *, extra_accept: str | None = None
+) -> dict[str, str]:
     """Build standard GitHub REST headers without logging or persisting tokens."""
     headers: dict[str, str] = {
         "Accept": extra_accept or "application/vnd.github+json",
@@ -64,7 +175,7 @@ def validate_api_base_url(
     host = parsed.hostname.casefold().rstrip(".")
     configured = {
         str(item).strip().casefold().rstrip(".")
-        for item in (allowed_hosts or _DEFAULT_ALLOWED_HOSTS)
+        for item in (*_DEFAULT_ALLOWED_HOSTS, *(allowed_hosts or ()))
         if str(item).strip()
     }
     if host not in configured:
@@ -79,7 +190,13 @@ def validate_api_base_url(
 
 
 class GitHubClient:
-    """Small async GitHub REST client with a fixed, validated API origin."""
+    """Small async GitHub REST client with a fixed, validated API origin.
+
+    Every request performs a fresh A/AAAA preflight for the fixed host.  This
+    is not complete connection-level IP pinning: DNS can change between the
+    preflight and socket connection (DNS TOCTOU), so deployments also need an
+    egress firewall to enforce the public-destination policy at connect time.
+    """
 
     def __init__(
         self,
@@ -105,6 +222,7 @@ class GitHubClient:
             headers=headers,
             timeout=httpx.Timeout(timeout),
             follow_redirects=False,
+            trust_env=False,
         )
 
     def _path(self, path: str) -> str:
@@ -136,21 +254,34 @@ class GitHubClient:
         """Close the underlying HTTP client."""
         await self._client.aclose()
 
+    async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        """Preflight the fixed API host before every network connection.
+
+        The lookup is a destination policy check, not connection-level DNS
+        pinning.  Deployments still need an egress firewall or proxy policy to
+        close the DNS time-of-check/time-of-use gap.
+        """
+        relative_path = self._path(path)
+        host = urlsplit(self._validated_base_url).hostname or ""
+        await _resolve_public_addresses(host, port=443)
+        request = getattr(self._client, method)
+        return await request(relative_path, **kwargs)
+
     async def get(self, path: str, **kwargs: Any) -> httpx.Response:
         """GET a relative API path without following redirects."""
-        return await self._client.get(self._path(path), **kwargs)
+        return await self._request("get", path, **kwargs)
 
     async def post(self, path: str, **kwargs: Any) -> httpx.Response:
-        return await self._client.post(self._path(path), **kwargs)
+        return await self._request("post", path, **kwargs)
 
     async def put(self, path: str, **kwargs: Any) -> httpx.Response:
-        return await self._client.put(self._path(path), **kwargs)
+        return await self._request("put", path, **kwargs)
 
     async def patch(self, path: str, **kwargs: Any) -> httpx.Response:
-        return await self._client.patch(self._path(path), **kwargs)
+        return await self._request("patch", path, **kwargs)
 
     async def delete(self, path: str, **kwargs: Any) -> httpx.Response:
-        return await self._client.delete(self._path(path), **kwargs)
+        return await self._request("delete", path, **kwargs)
 
     async def get_json(
         self, path: str, **kwargs: Any
