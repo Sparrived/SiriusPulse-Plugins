@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,96 +10,103 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from github_monitor import GitHubMonitorPlugin  # noqa: E402
-from sirius_pulse.plugins.context import PluginDataStore
+from sirius_pulse.plugins.context import PluginDataStore  # noqa: E402
 
 
-@pytest.mark.asyncio
-async def test_first_poll_only_initializes_cursor(monkeypatch, tmp_path):
-    payload = [
-        {
-            "id": "event-2",
-            "type": "IssuesEvent",
-            "actor": {"login": "alice"},
-            "payload": {"action": "opened", "issue": {"title": "Old issue"}},
-        }
-    ]
-    sent: list[dict] = []
-    store = PluginDataStore(tmp_path, "github_monitor")
+def _plugin_context(
+    data_dir: Path, config: dict | None = None
+) -> tuple[GitHubMonitorPlugin, PluginDataStore]:
+    store = PluginDataStore(data_dir, "github_monitor")
     plugin = GitHubMonitorPlugin()
+    plugin._ctx = SimpleNamespace(config=config or {}, data_store=store)
+    return plugin, store
 
-    async def dispatch(**kwargs):
-        sent.append(kwargs)
 
-    plugin._ctx = SimpleNamespace(
-        config={}, data_store=store, dispatch_proactive_message=dispatch
+def test_wrapper_reuses_full_monitor_background_task(tmp_path):
+    plugin, _store = _plugin_context(tmp_path, {"poll_seconds": 45})
+
+    specs = plugin.create_background_tasks()
+
+    assert len(specs) == 1
+    assert specs[0].name == "github_monitor_poll"
+    assert specs[0].interval_seconds == 30
+
+
+def test_wrapper_store_prefers_webui_settings_over_migrated_state(tmp_path):
+    plugin, store = _plugin_context(
+        tmp_path,
+        {"poll_seconds": 90, "repos": [{"owner": "new", "repo": "repo"}]},
     )
+    store.set("poll_seconds", 30)
+    store.set("repos", [{"owner": "old", "repo": "repo"}])
 
-    async def fake_fetch(*_args, **_kwargs):
-        return payload
+    adapted = plugin._legacy_context().get_data_store()
 
-    monkeypatch.setattr("github_monitor.fetch_repo_events", fake_fetch)
-
-    count = await plugin._poll_repo(object(), "owner", "repo", ["g1"], {"issues"})
-
-    assert count == 0
-    assert sent == []
-    assert store.get("last_event_id:owner/repo") == "event-2"
+    assert adapted.get("poll_seconds") == 90
+    assert adapted.get("repos") == [{"owner": "new", "repo": "repo"}]
 
 
-@pytest.mark.asyncio
-async def test_poll_sends_new_enabled_events(monkeypatch, tmp_path):
-    payload = [
-        {
-            "id": "event-2",
-            "type": "IssuesEvent",
-            "actor": {"login": "alice"},
-            "payload": {"action": "opened", "issue": {"title": "New issue"}},
-        },
-        {
-            "id": "event-1",
-            "type": "PushEvent",
-            "actor": {"login": "bob"},
-            "payload": {"commits": [{"message": "change"}]},
-        },
-    ]
-    sent: list[dict] = []
-    store = PluginDataStore(tmp_path, "github_monitor")
-    store.set("last_event_id:owner/repo", "event-1")
-    plugin = GitHubMonitorPlugin()
-
-    async def dispatch(**kwargs):
-        sent.append(kwargs)
-
-    plugin._ctx = SimpleNamespace(
-        config={}, data_store=store, dispatch_proactive_message=dispatch
+def test_legacy_tool_data_is_migrated_without_deleting_source(tmp_path):
+    persona_dir = tmp_path / "persona"
+    plugin_data_dir = persona_dir / "plugin_data"
+    legacy_path = persona_dir / "tool_data" / "github_monitor.json"
+    legacy_path.parent.mkdir(parents=True)
+    legacy_path.write_text(
+        json.dumps(
+            {
+                "poll_seconds": 60,
+                "repos": [{"owner": "owner", "repo": "repo"}],
+                "last_event_timestamps": {"owner/repo": "2026-01-01T00:00:00Z"},
+            }
+        ),
+        encoding="utf-8",
     )
+    plugin, store = _plugin_context(plugin_data_dir)
 
-    async def fake_fetch(*_args, **_kwargs):
-        return payload
+    plugin._migrate_legacy_store()
 
-    monkeypatch.setattr("github_monitor.fetch_repo_events", fake_fetch)
-
-    count = await plugin._poll_repo(object(), "owner", "repo", ["g1", "g2"], {"issues"})
-
-    assert count == 2
-    assert len(sent) == 2
-    assert {item["group_id"] for item in sent} == {"g1", "g2"}
-    assert all("New issue" in item["text"] for item in sent)
-    assert all(item["event_id"] == "github:owner/repo:event-2" for item in sent)
-    assert store.get("last_event_id:owner/repo") == "event-2"
+    assert legacy_path.is_file()
+    assert store.get("poll_seconds") == 60
+    assert store.get("repos") == [{"owner": "owner", "repo": "repo"}]
+    assert store.get("last_event_timestamps") == {"owner/repo": "2026-01-01T00:00:00Z"}
+    assert store.get("_legacy_migration_version") == 1
 
 
-def test_format_event_includes_repository_actor_action_and_title():
-    text = GitHubMonitorPlugin._format_event(
-        {
-            "type": "PullRequestEvent",
-            "actor": {"display_login": "alice"},
-            "payload": {
-                "action": "opened",
-                "pull_request": {"title": "Improve plugin API"},
-            },
-        },
-        "owner/repo",
+def test_legacy_skill_data_is_migrated(tmp_path):
+    persona_dir = tmp_path / "persona"
+    plugin_data_dir = persona_dir / "plugin_data"
+    legacy_path = persona_dir / "skill_data" / ".persona_skills.json"
+    legacy_path.parent.mkdir(parents=True)
+    legacy_path.write_text(
+        json.dumps(
+            {
+                "skills": {
+                    "github_monitor": {
+                        "webhook_port": 8123,
+                        "repos": [{"owner": "owner", "repo": "repo"}],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
     )
+    plugin, store = _plugin_context(plugin_data_dir)
 
-    assert text == "【GitHub】owner/repo：alice opened Improve plugin API"
+    plugin._migrate_legacy_store()
+
+    assert store.get("webhook_port") == 8123
+    assert store.get("repos") == [{"owner": "owner", "repo": "repo"}]
+    assert store.get("_legacy_migration_version") == 1
+
+
+def test_invalid_legacy_data_does_not_mark_migration_complete(tmp_path):
+    persona_dir = tmp_path / "persona"
+    plugin_data_dir = persona_dir / "plugin_data"
+    legacy_path = persona_dir / "skill_data" / "github_monitor.json"
+    legacy_path.parent.mkdir(parents=True)
+    legacy_path.write_text("{broken", encoding="utf-8")
+    plugin, store = _plugin_context(plugin_data_dir)
+
+    plugin._migrate_legacy_store()
+
+    assert store.get("_legacy_migration_version") is None

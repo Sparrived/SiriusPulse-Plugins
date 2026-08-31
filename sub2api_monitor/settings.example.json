@@ -1,0 +1,16 @@
+{
+  "base_url": "https://mollycloud.cn/keys",
+  "api_base_path": "/api/v1",
+  "login_path": "/auth/login",
+  "refresh_path": "/auth/refresh",
+  "logout_path": "/auth/logout",
+  "subscriptions_path": "/payment/checkout-info",
+  "group_rates_path": "/groups/rates",
+  "timezone": "Asia/Shanghai",
+  "poll_seconds": 300,
+  "timeout": 20,
+  "allow_insecure_http": false,
+  "notify_group_ids": [],
+  "adapter_type": "napcat",
+  "run_on_persona": ""
+}
