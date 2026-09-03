@@ -11,7 +11,6 @@ import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
-from uuid import uuid4
 
 from sirius_pulse.plugins.api import (
     BackgroundTaskSpec,
@@ -43,6 +42,7 @@ from .visual import (
     render_dashboard,
     validated_artifact_image,
 )
+from sirius_pulse.tools.builtin._internal._markdown_image import to_image_reference
 
 
 class Sub2APIMonitorPlugin(PluginBase):
@@ -1484,31 +1484,20 @@ class Sub2APIMonitorPlugin(PluginBase):
         image_path = validated_artifact_image(artifact_dir, rendered)
         if not image_path:
             return PluginResponse.fail("Playwright 可视化生成失败；请检查 Chromium 安装")
-        accepted = await self.ctx.dispatch_proactive_message(
-            group_id=group_id,
-            text=f"Sub2API 多站点运行图（{len(authorized)} 个站点）",
-            adapter_type=self._config_value(
-                "adapter_type", default="napcat", allow_empty=True
-            ),
-            event_id=f"sub2api-dashboard:{uuid4().hex}",
-            image_path=image_path,
-        )
-        if accepted is not True:
-            # 退避重试：群组可能正忙（dispatcher group_busy），
-            # 等待片刻后重试一次，避免偶发限流失效。
-            await asyncio.sleep(3.0)
-            accepted = await self.ctx.dispatch_proactive_message(
-                group_id=group_id,
-                text=f"Sub2API 多站点运行图（{len(authorized)} 个站点）",
-                adapter_type=self._config_value(
-                    "adapter_type", default="napcat", allow_empty=True
-                ),
-                event_id=f"sub2api-dashboard:{uuid4().hex}",
-                image_path=image_path,
-            )
-        if accepted is not True:
-            return PluginResponse.fail("可视化已生成，但当前群投递未确认")
-        return PluginResponse.ok(text="Sub2API 多站点运行图已发送。")
+        # 直接通过 adapter 发送，不走 chat 通道（避免 dispatcher group_busy 限流）
+        adapter = getattr(self.ctx, "adapter", None)
+        if adapter is None or not hasattr(adapter, "send_group_msg"):
+            return PluginResponse.fail("当前环境不支持直接发送消息")
+        try:
+            image_ref = to_image_reference(image_path)
+            segments: list[dict[str, Any]] = [
+                {"type": "text", "data": {"text": f"Sub2API 多站点运行图（{len(authorized)} 个站点）"}},
+                {"type": "image", "data": {"file": image_ref}},
+            ]
+            await adapter.send_group_msg(group_id, segments)
+            return PluginResponse.ok(text="Sub2API 多站点运行图已发送。")
+        except Exception as exc:
+            return PluginResponse.fail(f"可视化已生成，但发送失败：{exc}")
 
     async def _reset_sources(self, selector: str) -> None:
         async with self._poll_lock:
