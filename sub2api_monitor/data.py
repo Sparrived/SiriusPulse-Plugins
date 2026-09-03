@@ -374,6 +374,10 @@ def _normalize_rate_fields(item: dict[str, Any]) -> dict[str, Any]:
     for key, value in list(normalized.items()):
         if not is_group_rate_field(key):
             continue
+        # 布尔开关（如 allow_image_generation、image_rate_independent）
+        # 字段名可能含 rate/ratio 标记但不是倍率，直接忽略。
+        if isinstance(value, bool):
+            continue
         if not _finite_number(value):
             raise DataNormalizationError(f"分组倍率字段无效: {key}")
         normalized[key] = float(value)
@@ -389,7 +393,8 @@ def _rate_value(item: dict[str, Any]) -> float:
         (
             (_rate_field_priority(key), _normalize_field_name(key), str(key), value)
             for key, value in item.items()
-            if is_group_rate_field(key)
+            # 布尔开关（如 image_rate_independent）字段名含 "rate" 但不是倍率。
+            if is_group_rate_field(key) and not isinstance(value, bool)
         ),
         key=lambda value: value[:3],
     )

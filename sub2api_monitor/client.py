@@ -528,7 +528,11 @@ def _is_group_rate_record(value: Any, *, allow_scalar: bool = False) -> bool:
     if not isinstance(value, dict):
         return False
     rate_fields = [
-        field_value for key, field_value in value.items() if is_group_rate_field(key)
+        field_value
+        for key, field_value in value.items()
+        # 布尔开关（如 image_rate_independent）字段名也含 "rate"，
+        # 但不是数值倍率；忽略布尔值，避免整条记录被误拒。
+        if is_group_rate_field(key) and not isinstance(field_value, bool)
     ]
     return bool(rate_fields) and all(_finite_number(item) for item in rate_fields)
 
