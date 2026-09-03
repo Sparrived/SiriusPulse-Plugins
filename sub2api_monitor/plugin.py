@@ -1494,6 +1494,19 @@ class Sub2APIMonitorPlugin(PluginBase):
             image_path=image_path,
         )
         if accepted is not True:
+            # 退避重试：群组可能正忙（dispatcher group_busy），
+            # 等待片刻后重试一次，避免偶发限流失效。
+            await asyncio.sleep(3.0)
+            accepted = await self.ctx.dispatch_proactive_message(
+                group_id=group_id,
+                text=f"Sub2API 多站点运行图（{len(authorized)} 个站点）",
+                adapter_type=self._config_value(
+                    "adapter_type", default="napcat", allow_empty=True
+                ),
+                event_id=f"sub2api-dashboard:{uuid4().hex}",
+                image_path=image_path,
+            )
+        if accepted is not True:
             return PluginResponse.fail("可视化已生成，但当前群投递未确认")
         return PluginResponse.ok(text="Sub2API 多站点运行图已发送。")
 
