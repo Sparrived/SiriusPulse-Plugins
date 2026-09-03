@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import sys
+import zlib
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -12,6 +14,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import sub2api_monitor.client as client_module  # noqa: E402
 from sub2api_monitor import (  # noqa: E402
     Sub2APIClient,
     Sub2APIError,
@@ -38,14 +41,21 @@ def test_plugin_loader_discovers_metadata_and_runtime_class():
 
     assert definition is not None
     assert definition.name == "sub2api_monitor"
-    assert definition.dependencies == ["httpx>=0.24.0"]
+    assert definition.dependencies == ["httpx>=0.24.0", "playwright>=1.57.0"]
     assert {parameter.name for parameter in definition.parameters} >= {
-        "base_url",
-        "subscriptions_path",
-        "group_rates_path",
+        "sources",
         "notify_group_ids",
+        "visual_report_enabled",
     }
     parameters = {parameter.name: parameter for parameter in definition.parameters}
+    assert parameters["sources"].type == "object_array"
+    nested_fields = {field["name"]: field for field in parameters["sources"].fields}
+    assert nested_fields["id"]["required"] is True
+    assert nested_fields["display_name"]["type"] == "str"
+    assert nested_fields["subscriptions_path"]["required"] is True
+    assert nested_fields["group_rates_path"]["required"] is True
+    assert nested_fields["timeout"]["minimum"] == 1
+    assert nested_fields["timeout"]["maximum"] == 300
     assert parameters["poll_seconds"].minimum == 30
     assert parameters["poll_seconds"].maximum == 86400
     assert parameters["timeout"].minimum == 1
@@ -299,6 +309,43 @@ def test_client_rejects_cross_origin_endpoint():
         client.resolve_url(client.subscriptions_path)
 
 
+@pytest.mark.parametrize(
+    ("base_url", "endpoint"),
+    [
+        ("https://station.example/keys?access_token=secret", "plans"),
+        ("https://station.example/keys", "plans?api_key=secret"),
+        ("https://station.example/keys", "plans?accessToken=secret"),
+        ("https://station.example/keys", "plans?%2561ccessToken=secret"),
+        ("https://station.example/keys", "plans?email=bot@example.invalid"),
+        ("https://station.example/keys", "rates?refresh-token=secret"),
+        ("https://station.example/keys", "plans?credential=secret"),
+        ("https://station.example/keys", "plans?credentials=secret"),
+        ("https://station.example/keys", "plans?session-id=secret"),
+        ("https://station.example/keys#token=secret", "plans"),
+        ("https://station.example/keys#section", "plans"),
+    ],
+)
+def test_client_rejects_credentials_embedded_in_configured_urls(base_url, endpoint):
+    client = Sub2APIClient(
+        base_url=base_url,
+        api_base_path="/api/v1",
+        login_path="auth/login",
+        refresh_path="auth/refresh",
+        logout_path="auth/logout",
+        subscriptions_path=endpoint,
+        group_rates_path="groups/rates",
+        email="bot@example.invalid",
+        password="test-password",
+    )
+
+    if "?" in base_url or "#" in base_url:
+        with pytest.raises(Sub2APIError, match="查询参数|fragment"):
+            client._validate_transport_security()
+    else:
+        with pytest.raises(Sub2APIError, match="查询参数"):
+            client.resolve_url(endpoint)
+
+
 @pytest.mark.asyncio
 async def test_client_rejects_malformed_subscription_success_payload():
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -425,6 +472,153 @@ async def test_client_rejects_failure_envelopes_and_redacts_remote_error_secrets
             assert all(secret not in str(error.value) for secret in forbidden_values)
 
 
+@pytest.mark.asyncio
+async def test_client_bounds_decoded_gzip_responses_without_double_decoding(
+    monkeypatch,
+):
+    payload = json.dumps({"code": 0, "data": {"items": []}}).encode("utf-8")
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=gzip.compress(payload),
+            headers={"Content-Encoding": "gzip"},
+        )
+
+    client = _client_for_validation(transport=httpx.MockTransport(handler))
+    async with client:
+        assert await client._request_json("GET", "plans", authenticated=False) == {
+            "code": 0,
+            "data": {"items": []},
+        }
+
+    monkeypatch.setattr(client_module, "_MAX_RESPONSE_BYTES", 32)
+    oversized = json.dumps({"data": "x" * 256}).encode("utf-8")
+
+    async def oversized_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=gzip.compress(oversized),
+            headers={"Content-Encoding": "gzip"},
+        )
+
+    client = _client_for_validation(transport=httpx.MockTransport(oversized_handler))
+    async with client:
+        with pytest.raises(Sub2APIError, match="大小上限"):
+            await client._request_json("GET", "plans", authenticated=False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("encoding", "compress"),
+    [("gzip", gzip.compress), ("deflate", zlib.compress)],
+)
+async def test_client_incrementally_bounds_real_compressed_streams(
+    monkeypatch,
+    encoding,
+    compress,
+):
+    class CompressedStream(httpx.AsyncByteStream):
+        def __init__(self, content: bytes) -> None:
+            self.content = content
+
+        async def __aiter__(self):
+            midpoint = max(1, len(self.content) // 2)
+            yield self.content[:midpoint]
+            yield self.content[midpoint:]
+
+    payload = json.dumps({"code": 0, "data": {"items": []}}).encode("utf-8")
+
+    async def success_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=CompressedStream(compress(payload)),
+            headers={"Content-Encoding": encoding},
+        )
+
+    client = _client_for_validation(transport=httpx.MockTransport(success_handler))
+    async with client:
+        assert await client._request_json("GET", "plans", authenticated=False) == {
+            "code": 0,
+            "data": {"items": []},
+        }
+
+    monkeypatch.setattr(client_module, "_MAX_RESPONSE_BYTES", 64)
+
+    async def bomb_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=CompressedStream(compress(b"x" * 4096)),
+            headers={"Content-Encoding": encoding},
+        )
+
+    client = _client_for_validation(transport=httpx.MockTransport(bomb_handler))
+    async with client:
+        with pytest.raises(Sub2APIError, match="大小上限"):
+            await client._request_json("GET", "plans", authenticated=False)
+
+
+@pytest.mark.asyncio
+async def test_client_rejects_trailing_data_after_compressed_stream():
+    payload = json.dumps({"code": 0, "data": {"items": []}}).encode("utf-8")
+
+    class TrailingStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield gzip.compress(payload) + b"unexpected-trailer"
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=TrailingStream(),
+            headers={"Content-Encoding": "gzip"},
+        )
+
+    client = _client_for_validation(transport=httpx.MockTransport(handler))
+    async with client:
+        with pytest.raises(Sub2APIError, match="压缩响应无效"):
+            await client._request_json("GET", "plans", authenticated=False)
+
+
+@pytest.mark.asyncio
+async def test_client_rejects_unsupported_stream_compression():
+    class EncodedStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"encoded"
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=EncodedStream(),
+            headers={"Content-Encoding": "br"},
+        )
+
+    client = _client_for_validation(transport=httpx.MockTransport(handler))
+    async with client:
+        with pytest.raises(Sub2APIError, match="不支持的压缩编码"):
+            await client._request_json("GET", "plans", authenticated=False)
+
+
+def test_normalizers_reject_oversized_mappings_before_projection():
+    oversized_subscriptions = {
+        "data": {"items": {str(index): {"name": "plan"} for index in range(2001)}}
+    }
+    oversized_rates = {str(index): 1 for index in range(2001)}
+
+    with pytest.raises(DataNormalizationError, match="记录超过安全上限"):
+        normalize_subscriptions(oversized_subscriptions)
+    with pytest.raises(DataNormalizationError, match="记录超过安全上限"):
+        normalize_group_rates(oversized_rates)
+
+
+def test_runtime_redaction_fails_closed_for_short_reflected_credentials():
+    from sub2api_monitor.data import redact_runtime_secrets
+
+    assert redact_runtime_secrets("remote error contains abc", ("abc",)) == "[已隐藏]"
+    assert redact_runtime_secrets({"message": "token xy leaked"}, ("xy",)) == {
+        "message": "[已隐藏]"
+    }
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
@@ -499,6 +693,16 @@ def test_client_rejects_invalid_url_and_transport_configurations():
         )._validate_transport_security()
     with pytest.raises(Sub2APIError, match="目录穿越"):
         _client_for_validation().resolve_url("%252e%252e/private")
+    nested_traversal = "%2e%2e"
+    for _ in range(8):
+        nested_traversal = nested_traversal.replace("%", "%25")
+    with pytest.raises(Sub2APIError, match="目录穿越"):
+        _client_for_validation().resolve_url(f"{nested_traversal}/private")
+    over_encoded = "%2e%2e"
+    for _ in range(16):
+        over_encoded = over_encoded.replace("%", "%25")
+    with pytest.raises(Sub2APIError, match="过度嵌套"):
+        _client_for_validation().resolve_url(f"{over_encoded}/private")
     with pytest.raises(Sub2APIError, match="api_base_path"):
         _client_for_validation(api_base_path="//[").resolve_url("plans")
     with pytest.raises(Sub2APIError, match="timeout"):
@@ -549,8 +753,8 @@ def test_rate_event_key_ignores_display_name_changes():
 class _SequenceClient:
     def __init__(
         self,
-        subscriptions: list[list[dict[str, Any]]],
-        rates: list[list[dict[str, Any]]],
+        subscriptions: list[list[dict[str, Any]] | BaseException],
+        rates: list[list[dict[str, Any]] | BaseException],
     ) -> None:
         self.subscriptions = subscriptions
         self.rates = rates
@@ -560,11 +764,15 @@ class _SequenceClient:
     async def fetch_subscriptions(self) -> list[dict[str, Any]]:
         value = self.subscriptions[self.subscription_index]
         self.subscription_index += 1
+        if isinstance(value, BaseException):
+            raise value
         return value
 
     async def fetch_group_rates(self) -> list[dict[str, Any]]:
         value = self.rates[self.rate_index]
         self.rate_index += 1
+        if isinstance(value, BaseException):
+            raise value
         return value
 
 
@@ -596,8 +804,9 @@ async def test_poll_initializes_then_notifies_subscription_and_rate_changes(tmp_
         ],
     )
 
-    async def dispatch(**kwargs: Any) -> None:
+    async def dispatch(**kwargs: Any) -> bool:
         sent.append(kwargs)
+        return True
 
     plugin._ctx = SimpleNamespace(
         config={
@@ -633,6 +842,45 @@ async def test_poll_initializes_then_notifies_subscription_and_rate_changes(tmp_
     persisted = json.dumps(store.all(), ensure_ascii=False)
     assert "test-password" not in persisted
     assert "bot@example.invalid" not in persisted
+
+
+@pytest.mark.asyncio
+async def test_poll_advances_successful_collection_when_other_endpoint_fails(tmp_path):
+    store = PluginDataStore(tmp_path, "sub2api_monitor")
+    plugin = Sub2APIMonitorPlugin()
+    plugin._client = _SequenceClient(  # type: ignore[assignment]
+        subscriptions=[
+            [{"id": "plan", "name": "基础", "price": 10}],
+            [{"id": "plan", "name": "基础", "price": 20}],
+        ],
+        rates=[
+            [{"id": "group", "rate_multiplier": 1}],
+            Sub2APIError("temporary rate failure"),
+        ],
+    )
+    plugin._ctx = SimpleNamespace(
+        config={
+            "base_url": "https://station.example/keys",
+            "subscriptions_path": "plans",
+            "group_rates_path": "rates",
+            "notify_group_ids": [],
+        },
+        data_store=store,
+    )
+
+    first = await plugin.poll_once(notify=False)
+    first_success = store.get("last_poll_success_at")
+    second = await plugin.poll_once(notify=False)
+
+    assert sorted(first.initialized) == ["group_rates", "subscriptions"]
+    assert second.subscription_changed == 1
+    assert second.errors == ["分组倍率接口：temporary rate failure"]
+    assert store.get("subscriptions_snapshot") == [
+        {"id": "plan", "name": "基础", "price": 20}
+    ]
+    assert store.get("group_rates_snapshot") == [{"id": "group", "rate_multiplier": 1}]
+    assert store.get("last_poll_success_at") == first_success
+    assert "temporary rate failure" in store.get("last_poll_error")
 
 
 @pytest.mark.asyncio
@@ -764,6 +1012,34 @@ async def test_corrupt_store_is_reported_until_reset(tmp_path):
     store.clear()
     assert store.load_error is None
     assert store.all() == {}
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("poll_seconds", True, "poll_seconds"),
+        ("timeout", True, "timeout"),
+        ("notify_group_ids", ["10001", True], "notify_group_ids"),
+        ("notify_group_ids", [{"group": "10001"}], "notify_group_ids"),
+        ("notify_group_ids", ["bad\nvalue"], "notify_group_ids"),
+    ],
+)
+def test_plugin_rejects_invalid_runtime_setting_types(tmp_path, key, value, message):
+    config = {
+        "base_url": "https://station.example/keys",
+        "subscriptions_path": "plans",
+        "group_rates_path": "rates",
+        "notify_group_ids": ["10001"],
+    }
+    config[key] = value
+    plugin = Sub2APIMonitorPlugin()
+    plugin._ctx = SimpleNamespace(
+        config=config,
+        data_store=PluginDataStore(tmp_path, "sub2api_monitor"),
+    )
+
+    with pytest.raises(Sub2APIError, match=message):
+        plugin._validate_config()
 
 
 def test_background_task_requires_credentials_target_and_designated_persona(

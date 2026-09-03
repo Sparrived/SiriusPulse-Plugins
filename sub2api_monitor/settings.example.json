@@ -1,16 +1,49 @@
 {
-  "base_url": "https://sub2api.example.invalid/keys",
-  "api_base_path": "/api/v1",
-  "login_path": "/auth/login",
-  "refresh_path": "/auth/refresh",
-  "logout_path": "/auth/logout",
-  "subscriptions_path": "/your/subscriptions-path",
-  "group_rates_path": "/your/group-rates-path",
-  "timezone": "Asia/Shanghai",
+  "sources": [
+    {
+      "id": "primary",
+      "display_name": "Primary Sub2API",
+      "enabled": true,
+      "base_url": "https://primary.example.invalid/portal",
+      "api_base_path": "/api/v1",
+      "login_path": "/auth/login",
+      "refresh_path": "/auth/refresh",
+      "logout_path": "/auth/logout",
+      "subscriptions_path": "/your/subscriptions-path",
+      "group_rates_path": "/your/group-rates-path",
+      "timezone": "Asia/Shanghai",
+      "timeout": 20,
+      "allow_insecure_http": false,
+      "inherit_notify_group_ids": true,
+      "notify_group_ids": [
+        "replace-with-primary-group-id"
+      ]
+    },
+    {
+      "id": "backup_cn",
+      "display_name": "Backup Sub2API",
+      "enabled": true,
+      "base_url": "https://backup.example.invalid/portal",
+      "api_base_path": "/api/v1",
+      "login_path": "/auth/login",
+      "refresh_path": "/auth/refresh",
+      "logout_path": "/auth/logout",
+      "subscriptions_path": "/your/subscriptions-path",
+      "group_rates_path": "/your/group-rates-path",
+      "timezone": "Asia/Shanghai",
+      "timeout": 20,
+      "allow_insecure_http": false,
+      "inherit_notify_group_ids": false,
+      "notify_group_ids": [
+        "replace-with-backup-group-id"
+      ]
+    }
+  ],
   "poll_seconds": 300,
-  "timeout": 20,
-  "allow_insecure_http": false,
-  "notify_group_ids": [],
+  "notify_group_ids": [
+    "replace-with-global-group-id"
+  ],
   "adapter_type": "napcat",
-  "run_on_persona": "your-persona-name"
+  "run_on_persona": "your-sole-polling-persona",
+  "visual_report_enabled": true
 }

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import math
+import re
 import time
+import zlib
 from typing import Any
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlsplit, urlunsplit
 
 import httpx
 
@@ -17,7 +20,10 @@ from .data import (
     normalize_group_rates,
     normalize_subscriptions,
     redact,
+    redact_runtime_secrets,
 )
+
+_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 
 
 class Sub2APIError(RuntimeError):
@@ -80,7 +86,7 @@ class Sub2APIClient:
         self._http = httpx.AsyncClient(
             timeout=httpx.Timeout(self.timeout),
             follow_redirects=False,
-            headers={"Accept": "application/json"},
+            headers={"Accept": "application/json", "Accept-Encoding": "identity"},
             transport=self._transport,
         )
         return self
@@ -126,9 +132,7 @@ class Sub2APIClient:
 
     async def _login_unlocked(self) -> None:
         if not self.email or not self.password:
-            raise Sub2APIError(
-                "未配置 Sub2API 登录凭据，请设置 SUB2API_EMAIL 和 SUB2API_PASSWORD 环境变量"
-            )
+            raise Sub2APIError("未配置 Sub2API 登录凭据；请检查该站点对应的环境变量")
         payload = await self._request_json(
             "POST",
             self.login_path,
@@ -178,7 +182,7 @@ class Sub2APIClient:
         elif not isinstance(data, list):
             raise Sub2APIError("Sub2API 订阅响应格式无效")
         try:
-            return normalize_subscriptions(payload)
+            return normalize_subscriptions(self._redact_payload(payload))
         except DataNormalizationError as exc:
             raise Sub2APIError(f"Sub2API 订阅响应格式无效：{exc}") from exc
 
@@ -189,7 +193,7 @@ class Sub2APIClient:
         if not _is_group_rate_payload(data):
             raise Sub2APIError("Sub2API 分组倍率响应缺少有效的倍率字段")
         try:
-            return normalize_group_rates(payload)
+            return normalize_group_rates(self._redact_payload(payload))
         except DataNormalizationError as exc:
             raise Sub2APIError(f"Sub2API 分组倍率响应格式无效：{exc}") from exc
 
@@ -220,14 +224,32 @@ class Sub2APIClient:
             if "timezone" not in parsed_url.params:
                 url = str(parsed_url.copy_add_param("timezone", self.timezone))
 
+        streamed: httpx.Response | None = None
         try:
-            response = await self._http.request(
+            request = self._http.build_request(
                 method.upper(), url, json=json_body, headers=headers
+            )
+            streamed = await self._http.send(request, stream=True)
+            content = await _bounded_response_content(streamed)
+            decoded_headers = [
+                (key, value)
+                for key, value in streamed.headers.multi_items()
+                if key.casefold() not in {"content-encoding", "content-length"}
+            ]
+            response = httpx.Response(
+                streamed.status_code,
+                headers=decoded_headers,
+                content=content,
+                request=request,
+                extensions=streamed.extensions,
             )
         except httpx.TimeoutException as exc:
             raise Sub2APIError("Sub2API 请求超时") from exc
         except httpx.RequestError as exc:
             raise Sub2APIError(f"无法连接 Sub2API：{type(exc).__name__}") from exc
+        finally:
+            if streamed is not None:
+                await streamed.aclose()
 
         if response.status_code == 401 and authenticated and retry_auth:
             # One retry handles revoked/expired tokens without creating an auth loop.
@@ -263,16 +285,24 @@ class Sub2APIClient:
             raise Sub2APIError(f"Sub2API 接口失败：{message}")
         return payload
 
+    def _runtime_secrets(self) -> tuple[str, ...]:
+        return tuple(
+            secret
+            for secret in (
+                self.password,
+                self.email,
+                self._access_token,
+                self._refresh_token,
+            )
+            if secret
+        )
+
+    def _redact_payload(self, value: Any) -> Any:
+        return redact_runtime_secrets(redact(value), self._runtime_secrets())
+
     def _redact_secrets(self, message: str) -> str:
-        for secret in (
-            self.password,
-            self.email,
-            self._access_token,
-            self._refresh_token,
-        ):
-            if secret:
-                message = message.replace(secret, "[已隐藏]")
-        return message
+        redacted = redact_runtime_secrets(message, self._runtime_secrets())
+        return str(redacted)
 
     def _set_tokens(self, data: Any, *, require_refresh: bool) -> None:
         token = _token_string(
@@ -308,6 +338,14 @@ class Sub2APIClient:
         parsed = _parse_origin(self.base_url)
         if parsed is None:
             raise Sub2APIError("base_url 必须是有效的 http(s) 地址，且不能包含用户名、密码或控制字符")
+        try:
+            parsed_base = urlsplit(self.base_url)
+        except ValueError as exc:
+            raise Sub2APIError("base_url 必须是有效的 http(s) 地址") from exc
+        if parsed_base.fragment:
+            raise Sub2APIError("base_url 不得包含 fragment")
+        if _contains_sensitive_query(parsed_base.query):
+            raise Sub2APIError("base_url 不得在查询参数中包含凭据")
         scheme, host, _port, _origin = parsed
         if scheme == "https":
             return
@@ -331,6 +369,8 @@ class Sub2APIClient:
             parsed_endpoint = urlsplit(endpoint)
         except ValueError as exc:
             raise Sub2APIError("Sub2API 接口 URL 格式无效") from exc
+        if _contains_sensitive_query(parsed_endpoint.query):
+            raise Sub2APIError("Sub2API 接口 URL 不得在查询参数中包含凭据")
         if _is_absolute_url(endpoint):
             endpoint_origin = _parse_origin(endpoint)
             if endpoint_origin is None or endpoint_origin[:3] != base_origin[:3]:
@@ -372,6 +412,73 @@ class Sub2APIClient:
         return urlunsplit(
             (origin_url.scheme, origin_url.netloc, path, parsed_endpoint.query, "")
         )
+
+
+async def _bounded_response_content(response: httpx.Response) -> bytes:
+    """Read raw bytes and decode only supported encodings under a hard output cap."""
+    declared_length = response.headers.get("content-length", "").strip()
+    if declared_length:
+        try:
+            if int(declared_length) > _MAX_RESPONSE_BYTES:
+                raise Sub2APIError("Sub2API 响应超过安全大小上限")
+        except ValueError:
+            pass
+
+    if response.is_stream_consumed:
+        # MockTransport and custom in-process transports may hand HTTPX a
+        # preloaded response. HTTPX has already decoded it, so never decode it
+        # a second time; still enforce the decoded-size cap.
+        content = response.content
+        if len(content) > _MAX_RESPONSE_BYTES:
+            raise Sub2APIError("Sub2API 响应超过安全大小上限")
+        return content
+
+    encoding = response.headers.get("content-encoding", "").strip().casefold()
+    if encoding in {"", "identity"}:
+        decoder: Any | None = None
+    elif encoding == "gzip":
+        decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    elif encoding == "deflate":
+        decoder = zlib.decompressobj()
+    else:
+        raise Sub2APIError("Sub2API 响应使用了不支持的压缩编码")
+
+    chunks: list[bytes] = []
+    raw_received = 0
+    decoded_received = 0
+    try:
+        async for raw_chunk in response.aiter_raw():
+            raw_received += len(raw_chunk)
+            if raw_received > _MAX_RESPONSE_BYTES:
+                raise Sub2APIError("Sub2API 响应超过安全大小上限")
+            decoded_chunk = (
+                raw_chunk
+                if decoder is None
+                else decoder.decompress(
+                    raw_chunk,
+                    _MAX_RESPONSE_BYTES - decoded_received + 1,
+                )
+            )
+            decoded_received += len(decoded_chunk)
+            if decoded_received > _MAX_RESPONSE_BYTES or (
+                decoder is not None and decoder.unconsumed_tail
+            ):
+                raise Sub2APIError("Sub2API 响应超过安全大小上限")
+            chunks.append(decoded_chunk)
+        if decoder is not None:
+            tail = decoder.flush(_MAX_RESPONSE_BYTES - decoded_received + 1)
+            decoded_received += len(tail)
+            if (
+                decoded_received > _MAX_RESPONSE_BYTES
+                or not decoder.eof
+                or decoder.unconsumed_tail
+                or decoder.unused_data
+            ):
+                raise Sub2APIError("Sub2API 压缩响应无效或超过安全大小上限")
+            chunks.append(tail)
+    except zlib.error as exc:
+        raise Sub2APIError("Sub2API 压缩响应无效") from exc
+    return b"".join(chunks)
 
 
 def _validated_data(payload: Any, *, endpoint_name: str) -> Any:
@@ -509,6 +616,87 @@ def _has_control_character(value: str) -> bool:
     return any(ord(char) < 32 or ord(char) == 127 for char in value)
 
 
+def _contains_sensitive_query(query: str) -> bool:
+    """Reject credentials embedded in persisted endpoint configuration."""
+    sensitive_names = {
+        "auth",
+        "authentication",
+        "authorization",
+        "bearer",
+        "client_secret",
+        "credential",
+        "credentials",
+        "email",
+        "password",
+        "secret",
+        "session",
+        "session_id",
+        "token",
+        "username",
+        "access_token",
+        "refresh_token",
+        "api_key",
+    }
+    for key, _value in parse_qsl(query, keep_blank_values=True):
+        decoded_key = key
+        for _ in range(16):
+            unescaped = unquote(decoded_key)
+            if unescaped == decoded_key:
+                break
+            decoded_key = unescaped
+        else:
+            return True
+        with_word_boundaries = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", decoded_key)
+        normalized = re.sub(
+            r"[^a-z0-9]+",
+            "_",
+            with_word_boundaries.casefold(),
+        ).strip("_")
+        if normalized in sensitive_names or normalized.endswith(
+            (
+                "_token",
+                "_key",
+                "_secret",
+                "_password",
+                "_username",
+                "_email",
+                "_credential",
+                "_credentials",
+                "_auth",
+                "_session",
+            )
+        ):
+            return True
+    return False
+
+
+def _canonical_host(value: str) -> str:
+    host = str(value or "").casefold().rstrip(".")
+    if not host or "%" in host:
+        return ""
+    try:
+        return ipaddress.ip_address(host).compressed.casefold()
+    except ValueError:
+        pass
+    try:
+        ascii_host = host.encode("idna").decode("ascii").casefold()
+    except UnicodeError:
+        return ""
+    if len(ascii_host) > 253:
+        return ""
+    labels = ascii_host.split(".")
+    if any(
+        not label
+        or len(label) > 63
+        or label.startswith("-")
+        or label.endswith("-")
+        or re.fullmatch(r"[a-z0-9-]+", label) is None
+        for label in labels
+    ):
+        return ""
+    return ascii_host
+
+
 def _parse_origin(value: str) -> tuple[str, str, int, str] | None:
     try:
         parsed = urlsplit(value)
@@ -526,7 +714,7 @@ def _parse_origin(value: str) -> tuple[str, str, int, str] | None:
     ):
         return None
     scheme = parsed.scheme.casefold()
-    host = parsed.hostname.casefold().rstrip(".")
+    host = _canonical_host(parsed.hostname)
     if not host:
         return None
     effective_port = port if port is not None else (443 if scheme == "https" else 80)
@@ -552,11 +740,13 @@ def _normal_path(path: str) -> str:
     if not path.startswith("/"):
         path = "/" + path
     decoded = path
-    for _ in range(4):
+    for _ in range(16):
         unescaped = unquote(decoded)
         if unescaped == decoded:
             break
         decoded = unescaped
+    else:
+        raise Sub2APIError("Sub2API 接口路径包含过度嵌套的百分号编码")
     if "\\" in decoded or _has_control_character(decoded):
         raise Sub2APIError("Sub2API 接口路径包含非法字符")
     segments = decoded.split("/")

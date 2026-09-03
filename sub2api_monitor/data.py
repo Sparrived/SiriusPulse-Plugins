@@ -2,22 +2,33 @@
 
 from __future__ import annotations
 
+import html
 import json
 import math
 import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, quote_plus, urlencode, urlsplit, urlunsplit
 
 _SECRET_KEYS = {
     "access_token",
     "api_key",
     "authorization",
+    "auth",
+    "authentication",
+    "bearer",
+    "client_secret",
+    "credential",
+    "credentials",
+    "email",
     "key",
     "password",
     "refresh_token",
     "secret",
+    "session",
+    "session_id",
     "token",
+    "username",
 }
 _COLLECTION_KEYS = {
     "subscriptions": ("plans", "subscriptions", "items", "products"),
@@ -44,6 +55,10 @@ _SECRET_SUFFIXES = (
     "_secrets",
     "_password",
     "_passwords",
+    "_credential",
+    "_credentials",
+    "_auth",
+    "_session",
 )
 _RATE_EXCLUDED_MARKERS = (
     "limit",
@@ -56,6 +71,7 @@ _RATE_EXCLUDED_MARKERS = (
     "tpd",
 )
 _RATE_BOOLEAN_FIELDS = {"peak_rate_enabled"}
+_MAX_RECORDS = 2000
 
 
 class DataNormalizationError(ValueError):
@@ -107,11 +123,13 @@ def normalize_subscriptions(payload: Any) -> list[dict[str, Any]]:
         for key in _COLLECTION_KEYS["subscriptions"]:
             collection = data.get(key)
             if isinstance(collection, (list, dict)):
+                _validate_collection_size(collection)
                 records = _extract_records(data, (key,))
                 break
         if records is None:
             raise DataNormalizationError("订阅响应缺少有效列表")
     elif isinstance(data, list):
+        _validate_collection_size(data)
         records = data
     else:
         raise DataNormalizationError("订阅响应不是列表或映射")
@@ -129,6 +147,7 @@ def normalize_group_rates(payload: Any) -> list[dict[str, Any]]:
                 continue
             collection = data[wrapper_key]
             if isinstance(collection, (list, dict)):
+                _validate_collection_size(collection)
                 records = _extract_records(
                     data,
                     (wrapper_key,),
@@ -136,6 +155,7 @@ def normalize_group_rates(payload: Any) -> list[dict[str, Any]]:
                 )
                 break
         else:
+            _validate_collection_size(data)
             for record_id, value in data.items():
                 if isinstance(value, dict):
                     record = dict(value)
@@ -149,6 +169,7 @@ def normalize_group_rates(payload: Any) -> list[dict[str, Any]]:
                     raise DataNormalizationError("分组倍率映射包含非法记录")
                 records.append(record)
     elif isinstance(data, list):
+        _validate_collection_size(data)
         records = data
     else:
         raise DataNormalizationError("分组倍率响应不是列表或映射")
@@ -199,6 +220,11 @@ def canonical_record(record: dict[str, Any]) -> str:
     )
 
 
+def _validate_collection_size(collection: list[Any] | dict[Any, Any]) -> None:
+    if len(collection) > _MAX_RECORDS:
+        raise DataNormalizationError(f"响应记录超过安全上限 {_MAX_RECORDS}")
+
+
 def _extract_records(
     payload: Any,
     keys: Iterable[str],
@@ -240,7 +266,9 @@ def _extract_records(
 def _normalize_records(records: Iterable[Any], *, kind: str) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
-    for raw in records:
+    for index, raw in enumerate(records):
+        if index >= _MAX_RECORDS:
+            raise DataNormalizationError(f"响应记录超过安全上限 {_MAX_RECORDS}")
         if not isinstance(raw, dict):
             raise DataNormalizationError("响应列表包含非法记录")
         item = redact(raw)
@@ -433,6 +461,53 @@ def redact(value: Any, *, field_name: str = "") -> Any:
     if isinstance(value, str):
         return _redact_url(value)
     return value
+
+
+def redact_runtime_secrets(value: Any, secrets: Iterable[str]) -> Any:
+    """Remove exact in-memory credentials, including common encoded forms.
+
+    Field-name redaction remains the first line of defense.  This second pass
+    protects against an upstream service reflecting a credential under an
+    innocently named field such as ``message`` or ``value``.
+    """
+    variants: set[str] = set()
+    for raw_secret in secrets:
+        secret = str(raw_secret or "")
+        if not secret:
+            continue
+        variants.add(secret)
+        variants.add(html.escape(secret, quote=True))
+        variants.add(quote(secret, safe=""))
+        variants.add(quote_plus(secret, safe=""))
+        for ensure_ascii in (False, True):
+            encoded = json.dumps(secret, ensure_ascii=ensure_ascii)
+            variants.add(encoded[1:-1])
+    ordered = sorted((item for item in variants if item), key=len, reverse=True)
+    short_variants = tuple(item for item in ordered if len(item) < 4)
+    long_variants = tuple(item for item in ordered if len(item) >= 4)
+
+    def clean(item: Any) -> Any:
+        if isinstance(item, dict):
+            return {clean_text(str(key)): clean(child) for key, child in item.items()}
+        if isinstance(item, list):
+            return [clean(child) for child in item]
+        if isinstance(item, tuple):
+            return [clean(child) for child in item]
+        if isinstance(item, str):
+            return clean_text(item)
+        return item
+
+    def clean_text(text: str) -> str:
+        # Replacing a 1-3 character credential inline would corrupt nearly all
+        # ordinary text, while ignoring it leaks the exact runtime secret.
+        # Fail closed by hiding the whole reflected value whenever it occurs.
+        if any(secret in text for secret in short_variants):
+            return "[已隐藏]"
+        for secret in long_variants:
+            text = text.replace(secret, "[已隐藏]")
+        return text
+
+    return clean(value)
 
 
 def _is_secret_query_key(key: str) -> bool:

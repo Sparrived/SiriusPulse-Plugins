@@ -38,22 +38,43 @@ Push events are grouped for one notification and enriched through the Compare AP
 
 ## Sub2API Monitor
 
-Configure non-secret runtime settings through the host WebUI: `base_url`, API/login paths,
-**required** `subscriptions_path` and `group_rates_path`, polling interval, explicit
-`notify_group_ids` allowlist, and the one `run_on_persona` that is allowed to poll. Endpoint
-paths are runtime settings; the plugin has no hardcoded monitor endpoint or station URL. Use
-inert `example.invalid` values only as examples, then replace them with paths for your own
-station.
+Sub2API Monitor 0.3.0 requires Sirius Pulse 1.3.0+ and exposes a Chinese visual WebUI schema.
+Deployment operators add and edit `sources` as site cards; the Plugin author declares stable
+identity, field types, validation, labels, and layout once, and the presentation schema is never
+persisted as settings. Each source has a stable lowercase `id`, optional `display_name`,
+runtime-configured API/login paths, and required runtime `subscriptions_path` /
+`group_rates_path`; no station or monitor endpoint is hardcoded.
+A source ID such as `primary` derives `SUB2API_PRIMARY_EMAIL` and
+`SUB2API_PRIMARY_PASSWORD`. `display_name` is presentation-only. Secrets must enter the actual
+Persona Worker environment and must never be stored through WebUI/settings or
+`plugins/_config.json`.
 
-`SUB2API_EMAIL` and `SUB2API_PASSWORD` are the supported credential mechanism. Set both in
-the Sirius Pulse process environment; never store a password through WebUI or plugin settings
-(`plugins/_config.json`). `run_on_persona` must name the sole polling Persona. When blank, it
-disables both background polling and `/sub2api poll`.
+Top-level `notify_group_ids` is an explicit allowlist. A source with
+`inherit_notify_group_ids: true` merges that list with its own `notify_group_ids`; `false` uses
+only the source list. `run_on_persona` names the sole polling Persona, and a blank value disables
+background polling and `/sub2api poll`. An explicitly present `"sources": []` disables every
+source and never falls back to legacy top-level station fields.
 
-Use `/sub2api status`, `/sub2api poll`, `/sub2api subscriptions`, or `/sub2api rates`. The
-first snapshot and a changed monitoring source are silent. For later changes, per-group
-notification ACK state is retained when dispatch fails or is unconfirmed, so the next poll
-retries only the unacknowledged groups. Framework confirmation can mean adapter/platform
-admission or send confirmation, not that an end user read the message. See
-[`sub2api_monitor/README.md`](sub2api_monitor/README.md) for configuration and security
-details.
+Commands accept a source ID, a unique `display_name`, or `all` where applicable:
+`/sub2api status [selector]`, `/sub2api poll [selector]`,
+`/sub2api subscriptions <selector>`, `/sub2api rates <selector>`,
+`/sub2api report [selector]`, and `/sub2api reset [selector]`. The first snapshot and source
+identity changes are silent. Failed or unconfirmed dispatches retain source-scoped, per-group
+ACK state so only unacknowledged groups retry; framework confirmation can mean adapter/platform
+admission or send confirmation, not end-user reading.
+
+The Plugin declares Playwright, while non-Docker hosts must also provision Chromium (for
+example, `python -m playwright install chromium`); the official Docker image includes it.
+Automatic image failures fall back to authoritative text notifications. The explicit
+`/sub2api report` command instead reports a visualization failure. Legacy single-source
+configuration remains compatible while `sources` is absent and continues using
+`SUB2API_EMAIL` / `SUB2API_PASSWORD` plus legacy top-level state. On the first explicit-source
+poll, matching legacy collections migrate only when there is exactly one usable target, its
+credentials are complete, it has no existing new state, and that collection's legacy
+endpoint/account/timezone fingerprint matches exactly. Multi-source, existing-state, or
+fingerprint-mismatch cases are never guessed; legacy top-level data is retained. Collections
+with more than 20 detailed changes use one summary. One poll permits at most 200 physical
+dispatches, pre-allocates that budget fairly by selected source and collection, and rotates retry
+order so an early failing group cannot starve later groups. See [`sub2api_monitor/README.md`](sub2api_monitor/README.md) for the deterministic
+migration procedure, 4 MiB response / 2000-record limits, security constraints, and
+troubleshooting.
