@@ -136,6 +136,19 @@ class Sub2APIMonitorPlugin(PluginBase):
                     "default": [],
                     "description": "站点专属通知群；与继承的全局列表合并",
                 },
+                {
+                    "name": "email",
+                    "type": "str",
+                    "default": "",
+                    "description": "登录账号（邮箱）；留空时回退到环境变量",
+                },
+                {
+                    "name": "password",
+                    "type": "password",
+                    "default": "",
+                    "persist_secret": True,
+                    "description": "登录密码；留空时回退到环境变量",
+                },
             ],
         },
         {
@@ -298,8 +311,9 @@ class Sub2APIMonitorPlugin(PluginBase):
             "sources": {
                 "label": "站点列表",
                 "help": (
-                    "每个稳定 ID 派生 SUB2API_{ID}_EMAIL 与 SUB2API_{ID}_PASSWORD。"
-                    "WebUI 不读取或保存账号密码。"
+                    "每个站点可填写登录账号与密码；留空时回退到环境变量 "
+                    "SUB2API_{ID}_EMAIL 与 SUB2API_{ID}_PASSWORD。"
+                    "密码已保存后再次打开显示为空（留空保持不变）。"
                 ),
                 "span": 12,
                 "add_label": "添加 Sub2API 站点",
@@ -416,6 +430,18 @@ class Sub2APIMonitorPlugin(PluginBase):
                         "item_placeholder": "QQ群号",
                         "span": 8,
                     },
+                    "email": {
+                        "label": "登录账号",
+                        "help": "留空时回退到环境变量。",
+                        "placeholder": "account@example.com",
+                        "span": 6,
+                    },
+                    "password": {
+                        "label": "登录密码",
+                        "help": "留空时回退到环境变量；已保存后留空保持不变。",
+                        "placeholder": "已保存（留空保持不变）",
+                        "span": 6,
+                    },
                 },
                 "fieldsets": [
                     {
@@ -436,6 +462,13 @@ class Sub2APIMonitorPlugin(PluginBase):
                             "logout_path",
                         ],
                         "collapsed": True,
+                    },
+                    {
+                        "id": "credentials",
+                        "title": "登录凭据",
+                        "description": "可直接填写；留空回退到环境变量 SUB2API_{ID}_EMAIL / SUB2API_{ID}_PASSWORD",
+                        "fields": ["email", "password"],
+                        "collapsed": False,
                     },
                     {
                         "id": "monitoring",

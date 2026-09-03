@@ -30,6 +30,8 @@ _ALLOWED_SOURCE_FIELDS = {
     "allow_insecure_http",
     "inherit_notify_group_ids",
     "notify_group_ids",
+    "email",
+    "password",
 }
 
 
@@ -52,6 +54,8 @@ class SourceConfig:
     allow_insecure_http: bool
     inherit_notify_group_ids: bool
     notify_group_ids: tuple[str, ...]
+    email: str = ""
+    password: str = ""
     legacy: bool = False
 
     @property
@@ -68,10 +72,10 @@ class SourceConfig:
         return f"{self.env_prefix}_PASSWORD"
 
     def credentials(self) -> tuple[str, str]:
-        """Read credentials without copying them into persisted configuration."""
+        """Resolve credentials from WebUI-persisted config first, env as fallback."""
         return (
-            os.getenv(self.email_env, "").strip(),
-            os.getenv(self.password_env, ""),
+            (self.email or os.getenv(self.email_env, "")).strip(),
+            self.password or os.getenv(self.password_env, ""),
         )
 
     def client_kwargs(self) -> dict[str, Any]:
@@ -298,6 +302,8 @@ def _parse_source(raw: Any, index: int, *, legacy: bool = False) -> SourceConfig
         notify_group_ids=tuple(
             _parse_group_ids(raw.get("notify_group_ids", []), index)
         ),
+        email=str(raw.get("email", "") or ""),
+        password=str(raw.get("password", "") or ""),
         legacy=legacy,
     )
     source.validate_endpoints()
