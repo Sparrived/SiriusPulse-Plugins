@@ -1491,11 +1491,11 @@ class Sub2APIMonitorPlugin(PluginBase):
         try:
             image_ref = to_image_reference(image_path)
             segments: list[dict[str, Any]] = [
-                {"type": "text", "data": {"text": f"Sub2API 多站点运行图（{len(authorized)} 个站点）"}},
                 {"type": "image", "data": {"file": image_ref}},
             ]
             await adapter.send_group_msg(group_id, segments)
-            return PluginResponse.ok(text="Sub2API 多站点运行图已发送。")
+            # 图片已直接发送，静默返回避免框架再发一条提示文字
+            return PluginResponse.ok(render_mode="silent")
         except Exception as exc:
             return PluginResponse.fail(f"可视化已生成，但发送失败：{exc}")
 
