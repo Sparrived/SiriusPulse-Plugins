@@ -39,7 +39,8 @@ from .sources import (
 from .visual import (
     prune_artifacts,
     render_change_card,
-    render_dashboard,
+    render_rates_card,
+    render_subscriptions_card,
     validated_artifact_image,
 )
 from sirius_pulse.tools.builtin._internal._markdown_image import to_image_reference
@@ -184,7 +185,7 @@ class Sub2APIMonitorPlugin(PluginBase):
         {
             "name": "visual_report_enabled",
             "type": "bool",
-            "description": "使用 Playwright 为变化通知生成本地可视化图；失败时降级为文字。",
+            "description": "使用 Playwright 为查询与变化通知生成本地可视化图；失败时降级为文字。",
             "default": True,
             "group": "可视化",
         },
@@ -279,8 +280,8 @@ class Sub2APIMonitorPlugin(PluginBase):
             },
             {
                 "id": "visual",
-                "title": "可视化报告",
-                "description": "Playwright 只渲染本地生成的静态页面；失败时自动降级为文字。",
+                "title": "可视化输出",
+                "description": "倍率、订阅与变化通知均以本地渲染图片输出；失败时自动降级为文字。",
                 "parameters": ["visual_report_enabled"],
                 "columns": 1,
                 "collapsed": False,
@@ -520,8 +521,8 @@ class Sub2APIMonitorPlugin(PluginBase):
                 "span": 6,
             },
             "visual_report_enabled": {
-                "label": "变化通知图",
-                "help": "使用本地 Chromium 生成静态 PNG；渲染失败时仍发送权威文字结果。",
+                "label": "图片可视化",
+                "help": "倍率/订阅查询与变化通知以本地渲染 PNG 输出；渲染失败时仍发送权威文字结果。",
                 "widget": "switch",
                 "true_label": "生成图片",
                 "false_label": "仅文字",
@@ -609,14 +610,13 @@ class Sub2APIMonitorPlugin(PluginBase):
         prefix="/",
         patterns=["sub2api", "sub2api_monitor"],
         render_mode="direct",
-        description="查看、轮询或生成 Sub2API 多站点可视化报告。",
+        description="查看、轮询或可视化输出 Sub2API 多站点监控数据。",
         hidden_from_intent=True,
         examples=[
             "/sub2api status",
             "/sub2api poll all",
             "/sub2api subscriptions alpha",
             "/sub2api rates alpha",
-            "/sub2api report all",
         ],
     )
     def sub2api_command(self) -> PluginResponse:
@@ -670,10 +670,6 @@ class Sub2APIMonitorPlugin(PluginBase):
                 "check",
                 "检查",
                 "轮询",
-                "report",
-                "dashboard",
-                "图表",
-                "看板",
                 "reset",
                 "重置",
                 "subscriptions",
@@ -696,21 +692,23 @@ class Sub2APIMonitorPlugin(PluginBase):
             if action in {"subscriptions", "plans", "订阅"}:
                 source, data = await self._fetch_one("subscriptions", selector)
                 return [
-                    PluginResponse.ok(
-                        text=_format_records(f"{source.display_name} 当前订阅", data),
-                        data={"source": source.id, "items": data},
+                    await self._send_board_image(
+                        source,
+                        records=data,
+                        kind="subscription",
+                        fallback_title=f"{source.display_name} 当前订阅",
                     )
                 ]
             if action in {"rates", "groups", "倍率", "分组"}:
                 source, data = await self._fetch_one("group_rates", selector)
                 return [
-                    PluginResponse.ok(
-                        text=_format_records(f"{source.display_name} 当前分组倍率", data),
-                        data={"source": source.id, "items": data},
+                    await self._send_board_image(
+                        source,
+                        records=data,
+                        kind="rate",
+                        fallback_title=f"{source.display_name} 当前分组倍率",
                     )
                 ]
-            if action in {"report", "dashboard", "图表", "看板"}:
-                return [await self._send_dashboard(selector)]
             if action in {"reset", "重置"}:
                 await self._reset_sources(selector)
                 target = selector or "all"
@@ -722,7 +720,7 @@ class Sub2APIMonitorPlugin(PluginBase):
             return [
                 PluginResponse.fail(
                     "用法：/sub2api status|poll [id|all]|subscriptions <id>|"
-                    "rates <id>|report [id|all]|reset [id|all]"
+                    "rates <id>|reset [id|all]"
                 )
             ]
         except Exception as exc:  # noqa: BLE001
@@ -1460,44 +1458,65 @@ class Sub2APIMonitorPlugin(PluginBase):
                 return source, await client.fetch_subscriptions()
             return source, await client.fetch_group_rates()
 
-    async def _send_dashboard(self, selector: str) -> PluginResponse:
-        sources, errors = self._validate_config_partial()
-        if not sources and errors:
-            return PluginResponse.fail("Sub2API 站点配置无效：" + "；".join(errors))
-        selected = source_by_selector(sources, selector, require_one=False)
+    async def _send_board_image(
+        self,
+        source: SourceConfig,
+        *,
+        records: list[dict[str, Any]],
+        kind: str,
+        fallback_title: str,
+    ) -> PluginResponse:
+        """Render a records board and send it as a raw image via the adapter.
+
+        Falls back to human-readable text when Playwright rendering or the
+        direct adapter path is unavailable.
+        """
+        artifact_dir = self._artifact_dir()
+        generated_at = int(time.time())
+        rendered = None
+        # 用户主动查询不受轮询渲染预算限制，始终尝试出图；
+        # 预算仅约束后台轮询的通知渲染（见 _notify_change）。
+        if kind == "subscription":
+            rendered = await render_subscriptions_card(
+                records,
+                source_id=source.id,
+                display_name=source.display_name,
+                artifact_dir=artifact_dir,
+                generated_at=generated_at,
+            )
+        else:
+            rendered = await render_rates_card(
+                records,
+                source_id=source.id,
+                display_name=source.display_name,
+                artifact_dir=artifact_dir,
+                generated_at=generated_at,
+            )
+        image_path = validated_artifact_image(artifact_dir, rendered)
         group_id = str(
             getattr(getattr(self.ctx, "message", None), "group_id", "") or ""
         )
-        if not group_id:
-            return PluginResponse.fail("请在已授权的通知群中生成 Sub2API 运行图")
-        authorized = [
-            source for source in selected if group_id in self._notify_groups(source)
-        ]
-        if not authorized:
-            return PluginResponse.fail("当前群不在所选站点的通知允许列表中")
-        artifact_dir = self._artifact_dir()
-        rendered = await render_dashboard(
-            [self._dashboard_row(source) for source in authorized],
-            artifact_dir=artifact_dir,
-            generated_at=int(time.time()),
-        )
-        image_path = validated_artifact_image(artifact_dir, rendered)
-        if not image_path:
-            return PluginResponse.fail("Playwright 可视化生成失败；请检查 Chromium 安装")
-        # 直接通过 adapter 发送，不走 chat 通道（避免 dispatcher group_busy 限流）
         adapter = getattr(self.ctx, "adapter", None)
-        if adapter is None or not hasattr(adapter, "send_group_msg"):
-            return PluginResponse.fail("当前环境不支持直接发送消息")
-        try:
-            image_ref = to_image_reference(image_path)
-            segments: list[dict[str, Any]] = [
-                {"type": "image", "data": {"file": image_ref}},
-            ]
-            await adapter.send_group_msg(group_id, segments)
-            # 图片已直接发送，静默返回避免框架再发一条提示文字
-            return PluginResponse.ok(render_mode="silent")
-        except Exception as exc:
-            return PluginResponse.fail(f"可视化已生成，但发送失败：{exc}")
+        if image_path and group_id and adapter is not None and hasattr(
+            adapter, "send_group_msg"
+        ):
+            try:
+                image_ref = to_image_reference(image_path)
+                segments: list[dict[str, Any]] = [
+                    {"type": "image", "data": {"file": image_ref}},
+                ]
+                await adapter.send_group_msg(group_id, segments)
+                # 图片已直接发送；静默返回避免框架再发一条提示文字
+                return PluginResponse.ok(render_mode="silent")
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning(
+                    "Sub2API 可视化直发失败，回退文本：%s", self._safe_error(exc)
+                )
+        if not records:
+            return PluginResponse.ok(text=f"{fallback_title}：暂无数据")
+        return PluginResponse.ok(
+            text=_format_records(fallback_title, records, kind=kind)
+        )
 
     async def _reset_sources(self, selector: str) -> None:
         async with self._poll_lock:
@@ -1765,20 +1784,6 @@ class Sub2APIMonitorPlugin(PluginBase):
                 f"{'，最近一次轮询失败' if has_error else ''}。"
             )
         return "\n".join(lines)
-
-    def _dashboard_row(self, source: SourceConfig) -> dict[str, Any]:
-        state = self._source_state(source)
-        acks = self._load_notification_acks_from_state(state)
-        return {
-            "id": source.id,
-            "display_name": source.display_name,
-            "ready": source.enabled and all(source.credentials()),
-            "subscriptions": state.get("subscriptions_snapshot", []),
-            "rates": state.get("group_rates_snapshot", []),
-            "pending_acks": len(acks),
-            "last_success": state.get("last_poll_success_at"),
-            "error": "最近一次轮询失败" if state.get("last_poll_error") else "",
-        }
 
     def _legacy_source_fingerprint(self, name: str, source: SourceConfig) -> str:
         return self._provenance_fingerprint(name, source, source_id="")
@@ -2218,8 +2223,73 @@ def _primary_rate_value(record: dict[str, Any] | None) -> Any:
     return "未知"
 
 
-def _format_records(title: str, records: list[dict[str, Any]]) -> str:
-    body = json.dumps(records, ensure_ascii=False, indent=2)
+def _format_rate_line(record: dict[str, Any]) -> str:
+    """格式化单条倍率记录为人类易读的一行。"""
+    name = (
+        record.get("name")
+        or record.get("group_name")
+        or record.get("group")
+        or record.get("slug")
+        or f"分组 {record.get('id', '?')}"
+    )
+    rate = _primary_rate_value(record)
+    platform = record.get("platform")
+    status = record.get("status")
+    extras = []
+    if platform:
+        extras.append(str(platform))
+    if status and str(status) != "active":
+        extras.append(str(status))
+    extra_text = f"（{' · '.join(extras)}）" if extras else ""
+    try:
+        rate_text = f"{float(rate):g}x"
+    except (TypeError, ValueError):
+        rate_text = str(rate)
+    return f"· {name}：{rate_text}{extra_text}"
+
+
+def _format_subscription_line(record: dict[str, Any]) -> str:
+    """格式化单条订阅记录为人类易读的一行。"""
+    name = (
+        record.get("name")
+        or record.get("plan_name")
+        or record.get("product_name")
+        or record.get("slug")
+        or f"订阅 {record.get('id', '?')}"
+    )
+    extras = []
+    for key in ("plan", "plan_id", "status", "expires_at", "expire_at", "quota"):
+        value = record.get(key)
+        if value not in (None, ""):
+            extras.append(f"{key}: {value}")
+    extra_text = f"（{'，'.join(extras)}）" if extras else ""
+    return f"· {name}{extra_text}"
+
+
+def _format_records(title: str, records: list[dict[str, Any]], *, kind: str = "") -> str:
+    """把记录列表格式化为人类易读文本（不再输出原始 JSON）。"""
+    if not records:
+        return f"{title}：暂无数据"
+    if kind == "rate":
+        lines = [_format_rate_line(record) for record in records]
+    elif kind == "subscription":
+        lines = [_format_subscription_line(record) for record in records]
+    else:
+        lines = [
+            _format_rate_line(record)
+            if record.get("rate_multiplier") is not None
+            else _format_subscription_line(record)
+            for record in records
+        ]
+    body = "\n".join(lines)
     if len(body) > 3500:
-        body = body[:3500] + "\n...（输出过长，已截断）"
-    return f"{title}（{len(records)} 条）\n```json\n{body}\n```"
+        kept = []
+        total = 0
+        for line in lines:
+            if total + len(line) + 1 > 3400:
+                kept.append("…（其余已省略）")
+                break
+            kept.append(line)
+            total += len(line) + 1
+        body = "\n".join(kept)
+    return f"{title}（{len(records)} 个）\n{body}"

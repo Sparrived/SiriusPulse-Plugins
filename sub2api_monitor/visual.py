@@ -1,10 +1,16 @@
-"""Safe, local-only Playwright visualizations for the Sub2API monitor."""
+"""Safe, local-only Playwright visualizations for the Sub2API monitor.
+
+Visual language: dark signal-telemetry. Deep-ink canvas, moon-white display
+type, hairline blueprint grid, oversized tabular numerals, Lucide stroke
+icons. All rendering is local (network blocked, JS disabled, CSP enforced).
+"""
 
 from __future__ import annotations
 
 import asyncio
 import html
 import logging
+import math
 import os
 import re
 import time
@@ -33,14 +39,19 @@ _RENDER_SLOTS: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop, asyncio.Semaphore
 ] = weakref.WeakKeyDictionary()
 
+_MAX_BOARD_ROWS = 16
+_MAX_COMPARE_ROWS = 12
+
 _EVENT_LABELS = {
-    "subscription_added": ("SUBSCRIPTION / ONLINE", "订阅上架", "positive"),
-    "subscription_removed": ("SUBSCRIPTION / OFFLINE", "订阅下架", "danger"),
-    "subscription_changed": ("SUBSCRIPTION / REVISED", "订阅更新", "warning"),
-    "rate_added": ("RATE / ONLINE", "倍率新增", "positive"),
-    "rate_removed": ("RATE / OFFLINE", "倍率移除", "danger"),
-    "rate_changed": ("RATE / SHIFT", "倍率变化", "warning"),
+    "subscription_added": ("SUBSCRIPTION / ONLINE", "订阅上架", "good", "plus"),
+    "subscription_removed": ("SUBSCRIPTION / OFFLINE", "订阅下架", "bad", "minus"),
+    "subscription_changed": ("SUBSCRIPTION / REVISED", "订阅更新", "warn", "repeat"),
+    "rate_added": ("RATE / ONLINE", "倍率新增", "good", "plus"),
+    "rate_removed": ("RATE / OFFLINE", "倍率移除", "bad", "minus"),
+    "rate_changed": ("RATE / SHIFT", "倍率变化", "warn", "swap"),
 }
+_FALLBACK_EVENT = ("MONITOR / CHANGE", "配置变化", "warn", "swap")
+
 _SUBSCRIPTION_FIELDS = (
     "id",
     "name",
@@ -68,6 +79,7 @@ _RATE_FIELDS = (
     "group_id",
     "groupId",
     "name",
+    "platform",
     "rate_multiplier",
     "rate",
     "multiplier",
@@ -101,338 +113,513 @@ _FIELD_LABELS = {
     "stock": "库存",
     "status": "状态",
     "enabled": "启用",
-    "rate_multiplier": "主倍率",
+    "platform": "平台",
+    "rate_multiplier": "倍率",
     "rate": "倍率",
-    "multiplier": "乘数",
+    "multiplier": "倍率",
     "model_ratio": "模型倍率",
-    "completion_ratio": "输出倍率",
+    "completion_ratio": "补全倍率",
     "input_ratio": "输入倍率",
     "output_ratio": "输出倍率",
-    "ratio": "比率",
+    "ratio": "倍率",
     "weight": "权重",
-    "value": "值",
-    "peak_rate_enabled": "峰值倍率",
+    "value": "数值",
+    "peak_rate_enabled": "峰值启用",
     "peak_start": "峰值开始",
     "peak_end": "峰值结束",
 }
 
+# Lucide stroke icons (ISC-licensed, lucide.dev). Inner SVG for 24x24 viewBox.
+_ICONS: dict[str, str] = {
+    "activity": (
+        '<path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0'
+        'L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/>'
+    ),
+    "percent": (
+        '<line x1="19" x2="5" y1="5" y2="19"/>'
+        '<circle cx="6.5" cy="6.5" r="2.5"/><circle cx="17.5" cy="17.5" r="2.5"/>'
+    ),
+    "trending-up": '<path d="M16 7h6v6"/><path d="m22 7-8.5 8.5-5-5L2 17"/>',
+    "trending-down": '<path d="M16 17h6v-6"/><path d="m22 17-8.5-8.5-5 5L2 7"/>',
+    "swap": (
+        '<path d="m16 3 4 4-4 4"/><path d="M20 7H4"/>'
+        '<path d="m8 21-4-4 4-4"/><path d="M4 17h16"/>'
+    ),
+    "plus": '<path d="M5 12h14"/><path d="M12 5v14"/>',
+    "minus": '<path d="M5 12h14"/>',
+    "credit-card": (
+        '<rect width="20" height="14" x="2" y="5" rx="2"/>'
+        '<line x1="2" x2="22" y1="10" y2="10"/>'
+    ),
+    "wallet": (
+        '<path d="M19 7V4a1 1 0 0 0-1-1H5a2 2 0 0 0 0 4h15a1 1 0 0 1 1 1v4h-3'
+        'a2 2 0 0 0 0 4h3a1 1 0 0 0 1-1v-2a1 1 0 0 0-1-1"/>'
+        '<path d="M3 5v14a2 2 0 0 0 2 2h15a1 1 0 0 0 1-1v-4"/>'
+    ),
+    "repeat": (
+        '<path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/>'
+        '<path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/>'
+    ),
+    "clock": '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
+    "server": (
+        '<rect width="20" height="8" x="2" y="2" rx="2" ry="2"/>'
+        '<rect width="20" height="8" x="2" y="14" rx="2" ry="2"/>'
+        '<line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/>'
+    ),
+    "layers": (
+        '<path d="m12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91'
+        'a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z"/>'
+        '<path d="m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65"/>'
+        '<path d="m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65"/>'
+    ),
+    "gauge": '<path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/>',
+    "triangle-alert": (
+        '<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16'
+        'a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/>'
+    ),
+}
+
+
+def _icon(name: str, cls: str = "") -> str:
+    """Render one Lucide icon as an inline stroke SVG."""
+    body = _ICONS.get(name) or _ICONS["activity"]
+    klass = f' class="{_e(cls)}"' if cls else ""
+    return (
+        f'<svg{klass} viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+        'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" '
+        'aria-hidden="true">'
+        f"{body}</svg>"
+    )
+
+
 _BASE_CSS = """
 :root {
-  --ink: #071b2b;
-  --deep: #0b2f48;
-  --ocean: #124f6a;
-  --ice: #eaf7fa;
-  --paper: #fbfeff;
-  --line: #bdd6df;
-  --muted: #668391;
-  --mint: #23b6a7;
-  --amber: #f4b942;
-  --coral: #ef6a67;
+  --ink: #0a0d12;
+  --ink2: #0e131b;
+  --ink3: #131a26;
+  --line: #1b2330;
+  --line2: #2b3648;
+  --text: #edf2f7;
+  --dim: #8b96a5;
+  --faint: #5a6675;
+  --moon: #c9daee;
+  --good: #4ade9c;
+  --warn: #f5c044;
+  --bad: #ff6b6b;
+  --sans: "PingFang SC", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
+  --mono: "Cascadia Mono", "SF Mono", "JetBrains Mono", Consolas, ui-monospace,
+    "Microsoft YaHei", monospace;
 }
 * { box-sizing: border-box; }
-html, body { margin: 0; background: transparent; color: var(--ink); }
+html, body { margin: 0; background: transparent; color: var(--text); }
 body {
-  padding: 20px;
-  font-family: "Microsoft YaHei", "PingFang SC", ui-sans-serif, sans-serif;
+  padding: 0;
+  font-family: var(--sans);
+  -webkit-font-smoothing: antialiased;
 }
-"""
-
-_CHANGE_CSS = (
-    _BASE_CSS
-    + """
-#sub2api-card {
-  width: 1120px;
-  min-height: 650px;
-  display: grid;
-  grid-template-columns: 184px 1fr;
+article {
+  position: relative;
+  width: 620px;
   overflow: hidden;
-  background: var(--paper);
-  border: 1px solid #8db4c3;
-  box-shadow: 0 22px 60px rgba(4, 32, 50, 0.22);
+  background:
+    repeating-linear-gradient(0deg, rgba(255,255,255,.018) 0 1px, transparent 1px 28px),
+    repeating-linear-gradient(90deg, rgba(255,255,255,.018) 0 1px, transparent 1px 28px),
+    var(--ink);
+  border: 1px solid var(--line2);
 }
-.rail {
+article::before {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  content: "";
+  background: linear-gradient(180deg, var(--moon), rgba(201,218,238,0) 70%);
+}
+svg.ic { width: 12px; height: 12px; flex: none; }
+.brand {
   position: relative;
   display: flex;
-  flex-direction: column;
+  align-items: center;
   justify-content: space-between;
-  padding: 34px 24px;
-  overflow: hidden;
-  background: var(--deep);
-  color: #fff;
+  padding: 14px 22px;
+  border-bottom: 1px solid var(--line);
+  color: var(--faint);
+  font: 600 9.5px/1 var(--mono);
+  letter-spacing: .2em;
 }
-.rail::after {
-  position: absolute;
-  inset: 0;
-  content: "";
-  background: repeating-linear-gradient(
-    0deg,
-    transparent 0 37px,
-    rgba(255, 255, 255, 0.045) 38px 39px
-  );
-}
-.brand, .source, .pulse, .rail-foot { position: relative; z-index: 1; }
-.brand {
-  color: #9ed8e2;
-  font: 700 12px/1.3 ui-monospace, monospace;
-  letter-spacing: 0.18em;
-}
-.source {
-  max-height: 330px;
-  overflow: hidden;
-  font-size: 31px;
-  font-weight: 800;
-  line-height: 1.05;
-  letter-spacing: 0.06em;
-  text-overflow: ellipsis;
-  writing-mode: vertical-rl;
-  transform: rotate(180deg);
-}
-.source small {
-  margin-inline-start: 13px;
-  color: #8fc5d1;
-  font: 600 11px/1.2 ui-monospace, monospace;
-  letter-spacing: 0.12em;
-}
-.pulse {
-  height: 62px;
+.brand span { display: inline-flex; align-items: center; gap: 7px; }
+.foot {
+  position: relative;
   display: flex;
   align-items: center;
-  gap: 5px;
-  border-block: 1px solid rgba(255, 255, 255, 0.18);
-}
-.pulse i { width: 5px; display: block; background: var(--mint); }
-.pulse i:nth-child(3n + 1) { height: 13px; }
-.pulse i:nth-child(3n + 2) { height: 31px; }
-.pulse i:nth-child(3n) { height: 20px; }
-.pulse i:nth-child(5) { height: 44px; background: var(--amber); }
-.rail-foot {
-  color: #8fc5d1;
-  font: 600 10px/1.55 ui-monospace, monospace;
-  letter-spacing: 0.1em;
-}
-.main {
-  display: flex;
-  flex-direction: column;
-  gap: 28px;
-  padding: 42px 48px 38px;
-  background: linear-gradient(130deg, rgba(234, 247, 250, 0.58), transparent 46%);
-}
-.header {
-  display: flex;
-  align-items: flex-start;
   justify-content: space-between;
-  gap: 30px;
-  padding-bottom: 25px;
-  border-bottom: 2px solid var(--ink);
-}
-.eyebrow {
-  color: var(--ocean);
-  font: 700 11px/1.4 ui-monospace, monospace;
-  letter-spacing: 0.16em;
-}
-h1 {
-  max-width: 650px;
-  margin: 9px 0 0;
-  overflow-wrap: anywhere;
-  font-size: 42px;
-  line-height: 1.06;
-  letter-spacing: -0.045em;
-}
-.stamp {
-  color: var(--muted);
-  font: 600 11px/1.65 ui-monospace, monospace;
-  text-align: right;
+  gap: 16px;
+  padding: 13px 22px;
+  border-top: 1px solid var(--line);
+  color: var(--faint);
+  font: 600 9px/1.5 var(--mono);
+  letter-spacing: .16em;
   white-space: nowrap;
 }
-.badge {
-  display: inline-block;
-  margin-top: 8px;
-  padding: 7px 11px;
-  border: 1px solid var(--ink);
-  color: var(--ink);
-  font: 800 11px/1 ui-monospace, monospace;
-  letter-spacing: 0.09em;
-}
-.badge.positive { background: var(--mint); }
-.badge.warning { background: var(--amber); }
-.badge.danger { background: var(--coral); }
-.compare {
-  display: grid;
-  grid-template-columns: 1fr 44px 1fr;
-  align-items: stretch;
-}
-.panel {
-  min-height: 330px;
-  padding: 22px 24px;
-  border: 1px solid var(--line);
-  background: #fff;
-}
-.panel.after { border-color: #6fa9b6; background: var(--ice); }
-.panel-title {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 17px;
-  color: var(--muted);
-  font: 800 11px/1.2 ui-monospace, monospace;
-  letter-spacing: 0.13em;
-}
-.arrow {
-  display: grid;
-  place-items: center;
-  color: var(--ocean);
-  font: 700 25px/1 ui-monospace, monospace;
-}
-.row {
-  display: grid;
-  grid-template-columns: 120px 1fr;
-  gap: 14px;
-  padding: 10px 0;
-  border-top: 1px solid #d8e8ed;
-  font-size: 14px;
-  line-height: 1.4;
-}
-.row:first-of-type { border-top: 0; }
-.key {
-  overflow: hidden;
-  color: var(--muted);
-  font: 700 11px/1.4 ui-monospace, monospace;
-  text-overflow: ellipsis;
-}
-.value { overflow-wrap: anywhere; font-weight: 650; }
-.empty {
-  height: 220px;
-  display: grid;
-  place-items: center;
-  border: 1px dashed var(--line);
-  color: var(--muted);
-  font: 700 12px/1.5 ui-monospace, monospace;
-  letter-spacing: 0.08em;
-}
-.footer {
-  display: flex;
-  justify-content: space-between;
-  gap: 25px;
-  color: var(--muted);
-  font: 600 10px/1.4 ui-monospace, monospace;
-  letter-spacing: 0.08em;
-}
-"""
-)
-
-_DASHBOARD_CSS = (
-    _BASE_CSS
-    + """
-#sub2api-dashboard {
-  width: 1180px;
-  overflow: hidden;
-  background: var(--paper);
-  border: 1px solid #8db4c3;
-  box-shadow: 0 22px 60px rgba(4, 32, 50, 0.22);
-}
-.top {
+.head {
+  position: relative;
   display: grid;
   grid-template-columns: 1fr auto;
   align-items: end;
-  gap: 30px;
-  padding: 32px 38px;
-  background: var(--deep);
-  color: #fff;
+  gap: 18px;
+  padding: 24px 22px 20px;
 }
 .kicker {
-  color: #9ed8e2;
-  font: 700 11px/1.4 ui-monospace, monospace;
-  letter-spacing: 0.18em;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--dim);
+  font: 700 10px/1 var(--mono);
+  letter-spacing: .24em;
 }
-h1 { margin: 10px 0 0; font-size: 38px; line-height: 1; letter-spacing: -0.04em; }
-.meta {
-  color: #a8d1da;
-  font: 600 11px/1.6 ui-monospace, monospace;
+h1 {
+  margin: 10px 0 0;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: 30px;
+  font-weight: 800;
+  letter-spacing: -.03em;
+  line-height: 1.08;
+}
+.count {
+  color: var(--moon);
+  font: 700 42px/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -.04em;
   text-align: right;
 }
-.grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 18px;
-  padding: 28px;
-  background: linear-gradient(135deg, var(--ice), #fff 38%);
+.count small {
+  margin-left: 3px;
+  color: var(--faint);
+  font-size: 15px;
+  font-weight: 600;
 }
-.card {
-  --accent: var(--amber);
-  position: relative;
-  min-height: 255px;
-  overflow: hidden;
-  padding: 21px;
-  border: 1px solid var(--line);
-  background: #fff;
-}
-.card::before {
-  position: absolute;
-  inset: 0 auto 0 0;
-  width: 7px;
-  content: "";
-  background: var(--accent);
-}
-.card.online { --accent: var(--mint); }
-.card.degraded { --accent: var(--coral); }
-.card-head {
-  display: flex;
-  justify-content: space-between;
-  gap: 18px;
-  margin-bottom: 15px;
-  padding-bottom: 14px;
-  border-bottom: 1px solid #d8e8ed;
-}
-.name { overflow-wrap: anywhere; font-size: 22px; font-weight: 800; line-height: 1.1; }
-.sid {
-  color: var(--muted);
-  font: 700 10px/1.4 ui-monospace, monospace;
-  letter-spacing: 0.12em;
-}
-.state {
-  height: max-content;
-  padding: 6px 8px;
-  border: 1px solid var(--ink);
-  background: var(--accent);
-  font: 800 10px/1 ui-monospace, monospace;
-}
-.metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
-.metric { padding: 12px 10px; border-top: 2px solid var(--deep); background: var(--ice); }
-.metric b { display: block; font: 800 26px/1 ui-monospace, monospace; }
-.metric span { display: block; margin-top: 7px; color: var(--muted); font-size: 11px; }
-.rates { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 14px; }
-.rate {
-  padding: 6px 8px;
-  border: 1px solid var(--line);
-  background: #fff;
-  font: 650 10px/1.25 ui-monospace, monospace;
-}
-.alert {
-  margin-top: 14px;
-  padding: 9px 10px;
-  border-left: 3px solid var(--coral);
-  background: #fff0ef;
-  color: #713b39;
-  font-size: 11px;
-  line-height: 1.45;
-}
-.quiet {
-  margin-top: 14px;
-  color: var(--muted);
-  font: 600 10px/1.4 ui-monospace, monospace;
-}
-.foot {
-  display: flex;
-  justify-content: space-between;
-  gap: 24px;
-  padding: 14px 38px;
-  border-top: 1px solid var(--line);
-  color: var(--muted);
-  font: 600 10px/1.4 ui-monospace, monospace;
-  letter-spacing: 0.08em;
+.count-label {
+  margin-top: 6px;
+  color: var(--faint);
+  font: 600 8.5px/1 var(--mono);
+  letter-spacing: .22em;
+  text-align: right;
 }
 """
-)
+
+_BOARD_CSS = _BASE_CSS + """
+.rows { position: relative; padding: 4px 22px 12px; }
+.row {
+  display: grid;
+  grid-template-columns: 26px 1fr auto;
+  align-items: center;
+  gap: 12px;
+  padding: 10.5px 0;
+  border-top: 1px solid var(--line);
+}
+.rows .row:first-child { border-top: 0; }
+.idx { color: var(--faint); font: 600 9.5px/1 var(--mono); letter-spacing: .1em; }
+.who { min-width: 0; }
+.name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  overflow: hidden;
+  font-size: 14.5px;
+  font-weight: 650;
+  line-height: 1.25;
+  white-space: nowrap;
+}
+.name b {
+  overflow: hidden;
+  max-width: 330px;
+  text-overflow: ellipsis;
+}
+.chip {
+  flex: none;
+  padding: 2.5px 6px;
+  border: 1px solid var(--line2);
+  color: var(--faint);
+  font: 600 8.5px/1 var(--mono);
+  letter-spacing: .14em;
+  text-transform: uppercase;
+}
+.chip.t-warn { border-color: rgba(245,192,68,.4); color: var(--warn); }
+.chip.t-good { border-color: rgba(74,222,156,.4); color: var(--good); }
+.chip.t-bad { border-color: rgba(255,107,107,.4); color: var(--bad); }
+.track { height: 3px; margin-top: 7px; overflow: hidden; background: var(--ink3); }
+.track i { display: block; height: 100%; min-width: 2px; }
+.track .t-good { background: var(--good); }
+.track .t-warn { background: var(--warn); }
+.track .t-bad { background: var(--bad); }
+.track .t-moon { background: var(--moon); }
+.val {
+  color: var(--text);
+  font: 700 24px/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -.03em;
+  white-space: nowrap;
+}
+.val i {
+  margin-left: 2px;
+  color: var(--faint);
+  font-style: normal;
+  font-size: 12px;
+}
+.val.price { font-size: 20px; }
+.period {
+  margin-top: 4px;
+  color: var(--faint);
+  font: 600 9px/1 var(--mono);
+  letter-spacing: .12em;
+  text-align: right;
+}
+.t-good { color: var(--good); }
+.t-warn { color: var(--warn); }
+.t-bad { color: var(--bad); }
+.t-moon { color: var(--moon); }
+.t-dim { color: var(--dim); }
+.more {
+  padding: 10px 22px 2px;
+  color: var(--faint);
+  font: 600 9.5px/1 var(--mono);
+  letter-spacing: .16em;
+}
+.empty {
+  display: grid;
+  place-items: center;
+  gap: 10px;
+  margin: 4px 22px 14px;
+  padding: 34px 20px;
+  border: 1px dashed var(--line2);
+  text-align: center;
+}
+.empty svg.ic { width: 20px; height: 20px; color: var(--faint); }
+.empty b { color: var(--dim); font: 600 11px/1 var(--mono); letter-spacing: .2em; }
+.empty small { color: var(--faint); font: 500 9px/1.6 var(--mono); letter-spacing: .12em; }
+"""
+
+_CARD_CSS = _BASE_CSS + """
+.event {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--line2);
+  font: 700 9.5px/1 var(--mono);
+  letter-spacing: .2em;
+}
+.event svg.ic { width: 11px; height: 11px; }
+.event.t-good { border-color: rgba(74,222,156,.45); color: var(--good); background: rgba(74,222,156,.07); }
+.event.t-warn { border-color: rgba(245,192,68,.45); color: var(--warn); background: rgba(245,192,68,.07); }
+.event.t-bad { border-color: rgba(255,107,107,.45); color: var(--bad); background: rgba(255,107,107,.07); }
+.meta {
+  margin-top: 9px;
+  color: var(--faint);
+  font: 600 9.5px/1.6 var(--mono);
+  letter-spacing: .14em;
+}
+.compare {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1fr 52px 1fr;
+  align-items: stretch;
+  padding: 2px 22px 16px;
+}
+.panel {
+  min-width: 0;
+  padding: 14px 15px 12px;
+  border: 1px solid var(--line);
+  background: var(--ink2);
+}
+.panel.after { border-color: var(--line2); background: var(--ink3); }
+.ptitle {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 6px;
+  color: var(--faint);
+  font: 700 8.5px/1 var(--mono);
+  letter-spacing: .2em;
+}
+.prow {
+  display: grid;
+  grid-template-columns: 82px 1fr;
+  gap: 10px;
+  align-items: baseline;
+  padding: 7px 0;
+  border-top: 1px solid var(--line);
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+.prow:first-of-type { border-top: 0; }
+.pkey {
+  overflow: hidden;
+  color: var(--faint);
+  font: 600 9.5px/1.4 var(--mono);
+  letter-spacing: .06em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pval { overflow-wrap: anywhere; color: var(--dim); font-variant-numeric: tabular-nums; }
+.pval.cut { color: var(--faint); text-decoration: line-through; }
+.pval.hot { color: var(--moon); font-weight: 700; }
+.pval.none::before { content: "\\2014"; color: var(--faint); }
+.mid { display: grid; place-items: center; }
+.ring {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--line2);
+  border-radius: 50%;
+  color: var(--moon);
+}
+.ring svg.ic { width: 15px; height: 15px; }
+"""
+
+
+def build_rates_html(
+    *,
+    source_id: str,
+    display_name: str,
+    records: list[dict[str, Any]],
+    generated_at: int | None = None,
+) -> str:
+    """Build the group-rates board: indexed rows, proportional bars, big numerals."""
+    parsed: list[tuple[float | None, str, str, str]] = []
+    for record in records[:_MAX_BOARD_ROWS + 40]:
+        if not isinstance(record, dict):
+            continue
+        label = _subject_label(record)
+        platform = str(record.get("platform") or "").strip()
+        status = str(record.get("status") or "").strip().casefold()
+        value = _finite_rate(_primary_rate_value(record))
+        parsed.append((value, label, platform, status))
+    parsed = [item for item in parsed if item[1]]
+    parsed.sort(key=lambda item: (item[0] is None, item[0] if item[0] is not None else 0.0))
+    shown = parsed[:_MAX_BOARD_ROWS]
+    omitted = max(0, len(parsed) - len(shown))
+    finite_values = [value for value, *_rest in shown if value is not None]
+    peak = max(finite_values) if finite_values else 0.0
+
+    rows: list[str] = []
+    for index, (value, label, platform, status) in enumerate(shown, start=1):
+        tone = _rate_tone(value)
+        chip = f'<em class="chip">{_e(_clip(platform, 18))}</em>' if platform else ""
+        if status and status not in {"active", "enabled", "true", "1"}:
+            chip += f'<em class="chip t-warn">{_e(_clip(status, 16))}</em>'
+        if value is None:
+            row = (
+                '<div class="row">'
+                f'<span class="idx">{index:02d}</span>'
+                f'<div class="who"><div class="name"><b>{_e(_clip(label, 44))}</b>{chip}</div></div>'
+                '<span class="val t-dim">—</span>'
+                "</div>"
+            )
+        else:
+            width = 2 if peak <= 0 else max(2, round(value / peak * 100))
+            row = (
+                '<div class="row">'
+                f'<span class="idx">{index:02d}</span>'
+                f'<div class="who"><div class="name"><b>{_e(_clip(label, 44))}</b>{chip}</div>'
+                f'<div class="track"><i class="t-{tone}" style="width:{width}%"></i></div></div>'
+                f'<span class="val t-{tone}">{_fmt_rate(value)}<i>×</i></span>'
+                "</div>"
+            )
+        rows.append(row)
+    rows_html = "".join(rows) or _empty_state("NO RATES CAPTURED", "尚未捕获任何分组倍率")
+    more_html = f'<div class="more">+ {omitted} MORE / 其余分组未展示</div>' if omitted else ""
+    body = (
+        '<article id="sub2api-board">'
+        '<header class="brand">'
+        f'<span>{_icon("activity")} SIRIUS PULSE / SUB2API</span>'
+        f'<span>{_icon("clock")} {_e(_timestamp(generated_at))}</span>'
+        "</header>"
+        '<header class="head">'
+        '<div><div class="kicker">'
+        f'{_icon("percent")} GROUP RATES / 分组倍率</div>'
+        f"<h1>{_e(_clip(display_name, 40))}</h1></div>"
+        f'<div><div class="count">{len(parsed)}<small>G</small></div>'
+        '<div class="count-label">GROUPS / 分组</div></div>'
+        "</header>"
+        f'<section class="rows">{rows_html}</section>{more_html}'
+        '<footer class="foot">'
+        f"<span>SOURCE / {_e(_clip(source_id.upper(), 24))}</span>"
+        "<span>LOCAL RENDER · APPROVED FIELDS</span>"
+        "</footer></article>"
+    )
+    return _document(_BOARD_CSS, body)
+
+
+def build_subscriptions_html(
+    *,
+    source_id: str,
+    display_name: str,
+    records: list[dict[str, Any]],
+    generated_at: int | None = None,
+) -> str:
+    """Build the subscriptions board: name, price, cycle, status."""
+    parsed: list[dict[str, str]] = []
+    for record in records[:_MAX_BOARD_ROWS + 40]:
+        if not isinstance(record, dict):
+            continue
+        cleaned = redact(record) if isinstance(record, dict) else None
+        if not isinstance(cleaned, dict):
+            continue
+        label = _subject_label(cleaned)
+        if not label:
+            continue
+        parsed.append(cleaned)
+    shown = parsed[:_MAX_BOARD_ROWS]
+    omitted = max(0, len(parsed) - len(shown))
+
+    rows: list[str] = []
+    for index, record in enumerate(shown, start=1):
+        label = _subject_label(record)
+        group = (
+            record.get("group_name")
+            or record.get("groupName")
+            or record.get("group_id")
+            or record.get("groupId")
+        )
+        status = str(record.get("status") or "").strip()
+        enabled = record.get("enabled")
+        chips = ""
+        if group:
+            chips += f'<em class="chip">{_e(_clip(group, 20))}</em>'
+        status_text = status or ("active" if enabled is True else "")
+        if status_text and status_text.casefold() not in {"active", "enabled", "true", "1"}:
+            chips += f'<em class="chip t-warn">{_e(_clip(status_text, 16))}</em>'
+        price_html = _price_html(record)
+        rows.append(
+            '<div class="row">'
+            f'<span class="idx">{index:02d}</span>'
+            f'<div class="who"><div class="name"><b>{_e(_clip(label, 44))}</b>{chips}</div></div>'
+            f"<div>{price_html}</div>"
+            "</div>"
+        )
+    rows_html = "".join(rows) or _empty_state("NO SUBSCRIPTIONS", "暂无可售订阅")
+    more_html = f'<div class="more">+ {omitted} MORE / 其余订阅未展示</div>' if omitted else ""
+    body = (
+        '<article id="sub2api-board">'
+        '<header class="brand">'
+        f'<span>{_icon("activity")} SIRIUS PULSE / SUB2API</span>'
+        f'<span>{_icon("clock")} {_e(_timestamp(generated_at))}</span>'
+        "</header>"
+        '<header class="head">'
+        '<div><div class="kicker">'
+        f'{_icon("credit-card")} SUBSCRIPTIONS / 可售订阅</div>'
+        f"<h1>{_e(_clip(display_name, 40))}</h1></div>"
+        f'<div><div class="count">{len(parsed)}<small>S</small></div>'
+        '<div class="count-label">ITEMS / 订阅</div></div>'
+        "</header>"
+        f'<section class="rows">{rows_html}</section>{more_html}'
+        '<footer class="foot">'
+        f"<span>SOURCE / {_e(_clip(source_id.upper(), 24))}</span>"
+        "<span>LOCAL RENDER · APPROVED FIELDS</span>"
+        "</footer></article>"
+    )
+    return _document(_BOARD_CSS, body)
 
 
 def build_change_card_html(
@@ -444,75 +631,92 @@ def build_change_card_html(
     after: dict[str, Any] | None,
     occurred_at: int | None = None,
 ) -> str:
-    """Build an escaped change card containing only approved monitor fields."""
-    code, title, tone = _EVENT_LABELS.get(
-        event_type, ("MONITOR / CHANGE", "配置变化", "warning")
-    )
+    """Build a dark before/after change card containing only approved fields."""
+    code, title, tone, icon = _EVENT_LABELS.get(event_type, _FALLBACK_EVENT)
+    if event_type == "rate_changed":
+        direction = _rate_direction(before, after)
+        if direction == "up":
+            icon = "trending-up"
+        elif direction == "down":
+            icon = "trending-down"
     before_clean = _project_record(before, event_type)
     after_clean = _project_record(after, event_type)
-    record = after_clean or before_clean
-    before_rows = _record_rows(before_clean, empty_text="尚未存在")
-    after_rows = _record_rows(after_clean, empty_text="已移除")
-    pulse = "".join("<i></i>" for _ in range(12))
+    subject = _subject(after_clean or before_clean, event_type)
+    keys: list[str] = []
+    for key in (*before_clean, *after_clean):
+        if key not in keys:
+            keys.append(key)
+    before_rows = _compare_rows(before_clean, after_clean, changed_side="before")
+    after_rows = _compare_rows(after_clean, before_clean, changed_side="after")
     body = (
         '<article id="sub2api-card">'
-        '<aside class="rail">'
-        '<div class="brand">SIRIUS / SUB2API</div>'
-        f'<div class="source">{_e(_clip(display_name, 64))}'
-        f"<small>{_e(_clip(source_id.upper(), 32))}</small></div>"
-        f'<div class="pulse">{pulse}</div>'
-        '<div class="rail-foot">SOURCE SIGNAL<br>CHANGE CAPTURE</div>'
-        "</aside>"
-        '<main class="main">'
-        '<header class="header"><div>'
-        f'<div class="eyebrow">{_e(code)}</div>'
-        f"<h1>{_e(_subject(record, event_type))}</h1>"
-        '</div><div class="stamp">CAPTURED<br>'
-        f"{_e(_timestamp(occurred_at))}<br>"
-        f'<span class="badge {tone}">{_e(title)}</span>'
-        "</div></header>"
+        '<header class="brand">'
+        f'<span>{_icon("activity")} SIRIUS PULSE / SUB2API</span>'
+        f'<span>{_icon("clock")} {_e(_timestamp(occurred_at))}</span>'
+        "</header>"
+        '<header class="head">'
+        f'<div><span class="event t-{tone}">{_icon(icon)} {_e(code)} — {_e(title)}</span>'
+        f"<h1>{_e(subject)}</h1>"
+        f'<div class="meta">SOURCE / {_e(_clip(display_name, 48))}'
+        f' · {_e(_clip(source_id.upper(), 24))}</div></div>'
+        "</header>"
         '<section class="compare">'
-        '<div class="panel"><div class="panel-title">'
-        "<span>BEFORE / 变更前</span><span>01</span>"
-        f"</div>{before_rows}</div>"
-        '<div class="arrow">→</div>'
-        '<div class="panel after"><div class="panel-title">'
-        "<span>AFTER / 变更后</span><span>02</span>"
-        f"</div>{after_rows}</div>"
+        f'<div class="panel"><div class="ptitle"><span>BEFORE / 变更前</span><span>01</span></div>'
+        f"{before_rows}</div>"
+        f'<div class="mid"><span class="ring">{_icon(icon)}</span></div>'
+        f'<div class="panel after"><div class="ptitle"><span>AFTER / 变更后</span><span>02</span></div>'
+        f"{after_rows}</div>"
         "</section>"
-        '<footer class="footer">'
-        "<span>ENV CREDENTIALS · SNAPSHOT DIFF · DELIVERY ACK</span>"
-        "<span>APPROVED FIELDS ONLY</span>"
-        "</footer></main></article>"
-    )
-    return _document(_CHANGE_CSS, body)
-
-
-def build_dashboard_html(
-    sources: list[dict[str, Any]], *, generated_at: int | None = None
-) -> str:
-    """Build a bounded overview dashboard for up to ten monitor sources."""
-    visible = sources[:10]
-    omitted = max(0, len(sources) - len(visible))
-    cards = "".join(_dashboard_source_card(source) for source in visible)
-    if not cards:
-        cards = '<article class="card"><div class="name">尚无站点快照</div></article>'
-    omitted_text = f" · 另有 {omitted} 个站点未展开" if omitted else ""
-    body = (
-        '<article id="sub2api-dashboard">'
-        '<header class="top"><div>'
-        '<div class="kicker">SIRIUS PULSE / MULTI-SOURCE TELEMETRY</div>'
-        "<h1>Sub2API 站点运行图</h1>"
-        '</div><div class="meta">'
-        f"{len(sources)} SOURCES<br>{_e(_timestamp(generated_at))}"
-        "</div></header>"
-        f'<section class="grid">{cards}</section>'
         '<footer class="foot">'
-        "<span>ISOLATED ACCOUNTS · ISOLATED SNAPSHOTS</span>"
-        f"<span>LOCAL PLAYWRIGHT RENDER{_e(omitted_text)}</span>"
+        "<span>ENV CREDENTIALS · SNAPSHOT DIFF · ACK TRACKED</span>"
+        "<span>APPROVED FIELDS ONLY</span>"
         "</footer></article>"
     )
-    return _document(_DASHBOARD_CSS, body)
+    return _document(_CARD_CSS, body)
+
+
+async def render_rates_card(
+    records: list[dict[str, Any]],
+    *,
+    source_id: str,
+    display_name: str,
+    artifact_dir: Path,
+    generated_at: int | None = None,
+) -> str | None:
+    """Render the group-rates board, returning ``None`` on optional failure."""
+    return await _render_html(
+        build_rates_html(
+            source_id=source_id,
+            display_name=display_name,
+            records=records,
+            generated_at=generated_at,
+        ),
+        selector="#sub2api-board",
+        artifact_dir=artifact_dir,
+        filename_prefix=f"sub2api_rates_{_safe_slug(source_id)}",
+    )
+
+
+async def render_subscriptions_card(
+    records: list[dict[str, Any]],
+    *,
+    source_id: str,
+    display_name: str,
+    artifact_dir: Path,
+    generated_at: int | None = None,
+) -> str | None:
+    """Render the subscriptions board, returning ``None`` on optional failure."""
+    return await _render_html(
+        build_subscriptions_html(
+            source_id=source_id,
+            display_name=display_name,
+            records=records,
+            generated_at=generated_at,
+        ),
+        selector="#sub2api-board",
+        artifact_dir=artifact_dir,
+        filename_prefix=f"sub2api_subs_{_safe_slug(source_id)}",
+    )
 
 
 async def render_change_card(**kwargs: Any) -> str | None:
@@ -524,21 +728,6 @@ async def render_change_card(**kwargs: Any) -> str | None:
         selector="#sub2api-card",
         artifact_dir=artifact_dir,
         filename_prefix=f"sub2api_change_{_safe_slug(source_id)}",
-    )
-
-
-async def render_dashboard(
-    sources: list[dict[str, Any]],
-    *,
-    artifact_dir: Path,
-    generated_at: int | None = None,
-) -> str | None:
-    """Render a multi-source overview card."""
-    return await _render_html(
-        build_dashboard_html(sources, generated_at=generated_at),
-        selector="#sub2api-dashboard",
-        artifact_dir=Path(artifact_dir),
-        filename_prefix="sub2api_dashboard",
     )
 
 
@@ -607,8 +796,8 @@ async def _render_html_impl(
         )
         browser = launched_browser
         context = await launched_browser.new_context(
-            viewport={"width": 1220, "height": 1000},
-            device_scale_factor=1,
+            viewport={"width": 680, "height": 1400},
+            device_scale_factor=2,
             java_script_enabled=False,
             service_workers="block",
         )
@@ -686,64 +875,70 @@ async def _bounded_cleanup(action: Any, label: str) -> None:
 def _consume_task_result(task: asyncio.Task[Any]) -> None:
     if task.cancelled():
         return
-    try:
-        task.exception()
-    except (asyncio.CancelledError, Exception):
-        pass
+    exc = task.exception()
+    if exc is not None:
+        logger.debug("Sub2API 可视化清理任务异常: %s", type(exc).__name__)
 
 
 async def prune_artifacts(output_dir: Path) -> None:
-    """Bound only this plugin's generated PNG artifacts by age, count, and bytes."""
+    """Delete stale and oversized artifacts, keeping recent bounded PNG files."""
+    root = _artifact_root(output_dir)
     try:
-        root = _artifact_root(output_dir)
-        now = time.time()
-        for temporary in root.glob("sub2api_*.tmp.png"):
-            if temporary.is_symlink() or temporary.is_file():
-                temporary.unlink(missing_ok=True)
-        files: list[tuple[Path, os.stat_result]] = []
-        for path in root.glob("sub2api_*.png"):
-            if path.is_symlink():
-                path.unlink(missing_ok=True)
-                continue
-            if not path.is_file():
-                continue
-            _assert_safe_child(root, path)
-            files.append((path, path.stat()))
-        files.sort(key=lambda item: item[1].st_mtime, reverse=True)
-        kept = 0
-        total = 0
-        for path, stat in files:
-            expired = now - stat.st_mtime > _MAX_ARTIFACT_AGE_SECONDS
-            exceeds_budget = (
-                kept >= _MAX_ARTIFACT_FILES
-                or total + stat.st_size > _MAX_ARTIFACT_BYTES
-            )
-            if expired or exceeds_budget:
-                path.unlink(missing_ok=True)
-                continue
-            kept += 1
-            total += stat.st_size
-    except (OSError, ValueError):
-        logger.debug("sub2api_monitor: 清理可视化 artifact 失败", exc_info=True)
+        candidates = [path for path in root.iterdir() if path.is_file()]
+    except OSError:
+        return
+    keep: list[tuple[float, int, Path]] = []
+    freed = 0
+    for path in candidates:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if path.name.endswith(".tmp.png") or not path.name.endswith(".png"):
+            freed += stat.st_size
+            _quiet_unlink(path)
+            continue
+        keep.append((stat.st_mtime, stat.st_size, path))
+    keep.sort(reverse=True)
+    now = time.time()
+    total = 0
+    survivors: list[tuple[float, int, Path]] = []
+    for position, (mtime, size, path) in enumerate(keep):
+        expired = now - mtime > _MAX_ARTIFACT_AGE_SECONDS
+        overflow = position >= _MAX_ARTIFACT_FILES or total + size > _MAX_ARTIFACT_BYTES
+        if expired or overflow:
+            freed += size
+            _quiet_unlink(path)
+            continue
+        total += size
+        survivors.append((mtime, size, path))
+    for path in root.glob("*.tmp.png"):
+        _quiet_unlink(path)
+    if survivors:
+        newest = survivors[0][0]
+        if now - newest > _MAX_ARTIFACT_AGE_SECONDS:
+            pass  # keep newest regardless; prune never empties the directory
+    logger.debug("sub2api_monitor: 产物清理完成，保留 %d 个文件", len(survivors))
 
 
-# Backward-compatible private alias used by focused tests and callers.
-_prune_artifacts = prune_artifacts
+def _quiet_unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
 
 
 def validated_artifact_image(output_dir: Path, candidate: str | Path | None) -> str:
-    """Return a validated absolute PNG path or an empty string."""
+    """Return the candidate path when it is a validated PNG inside the sandbox."""
     if not candidate:
         return ""
     try:
-        root = _artifact_root(Path(output_dir))
         path = Path(candidate)
-        if not path.is_absolute():
-            return ""
+        root = _artifact_root(output_dir)
+        _assert_safe_child(root, path)
         _validate_png(root, path)
-        return str(path.resolve(strict=True))
+        return str(path)
     except (OSError, ValueError):
-        logger.warning("sub2api_monitor: 拒绝不安全的可视化图片路径")
         return ""
 
 
@@ -757,81 +952,27 @@ def _get_render_slots() -> asyncio.Semaphore:
 
 
 def _artifact_root(output_dir: Path) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    if output_dir.is_symlink() or not output_dir.is_dir():
-        raise ValueError("artifact 目录无效")
-    return output_dir.resolve(strict=True)
+    root = Path(output_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
 def _assert_safe_child(root: Path, path: Path) -> None:
-    resolved = path.resolve(strict=False)
-    if resolved.parent != root or path.is_symlink():
-        raise ValueError("artifact 路径越界")
+    resolved_root = root.resolve()
+    resolved = path.resolve()
+    if resolved_root != resolved and resolved_root not in resolved.parents:
+        raise ValueError("可视化产物路径越界")
 
 
 def _validate_png(root: Path, path: Path) -> None:
     _assert_safe_child(root, path)
-    if not path.is_file() or path.is_symlink():
-        raise ValueError("可视化不是普通文件")
     size = path.stat().st_size
-    if not 8 <= size <= _MAX_SCREENSHOT_BYTES:
-        raise ValueError("可视化图片大小无效")
-    with path.open("rb") as file:
-        if file.read(8) != _PNG_SIGNATURE:
-            raise ValueError("可视化图片格式无效")
-
-
-def _dashboard_source_card(source: dict[str, Any]) -> str:
-    name = _e(_clip(source.get("display_name") or source.get("id") or "Sub2API", 64))
-    source_id = _e(_clip(source.get("id") or "source", 32).upper())
-    subscriptions = source.get("subscriptions")
-    rates = source.get("rates")
-    subscription_count = len(subscriptions) if isinstance(subscriptions, list) else 0
-    rate_count = len(rates) if isinstance(rates, list) else 0
-    has_error = bool(source.get("error"))
-    ready = bool(source.get("ready"))
-    state = (
-        "online" if ready and not has_error else "degraded" if has_error else "waiting"
-    )
-    state_text = {"online": "ONLINE", "degraded": "DEGRADED", "waiting": "WAITING"}[
-        state
-    ]
-    rate_items: list[str] = []
-    if isinstance(rates, list):
-        for item in rates[:6]:
-            projected = _project_record(
-                item if isinstance(item, dict) else None, "rate_changed"
-            )
-            label = (
-                projected.get("group_name")
-                or projected.get("groupName")
-                or projected.get("name")
-                or projected.get("id")
-                or "group"
-            )
-            value = _primary_rate_value(projected)
-            rate_items.append(
-                f'<span class="rate">{_e(_clip(label, 48))} · {_e(_clip(value, 32))}</span>'
-            )
-    rates_html = "".join(rate_items) or '<span class="rate">暂无倍率快照</span>'
-    alert_html = '<div class="alert">最近一次轮询存在错误，请查看文字状态。</div>' if has_error else ""
-    last_success = _timestamp_or_waiting(source.get("last_success"))
-    pending = _bounded_nonnegative_int(source.get("pending_acks"))
-    return (
-        f'<article class="card {state}">'
-        '<div class="card-head"><div>'
-        f'<div class="name">{name}</div>'
-        f'<div class="sid">SOURCE / {source_id}</div>'
-        f'</div><span class="state">{state_text}</span></div>'
-        '<div class="metrics">'
-        f'<div class="metric"><b>{subscription_count}</b><span>可售订阅</span></div>'
-        f'<div class="metric"><b>{rate_count}</b><span>倍率分组</span></div>'
-        f'<div class="metric"><b>{pending}</b><span>待确认事件</span></div>'
-        "</div>"
-        f'<div class="rates">{rates_html}</div>{alert_html}'
-        f'<div class="quiet">LAST SUCCESS / {_e(last_success)}</div>'
-        "</article>"
-    )
+    if not 64 <= size <= _MAX_SCREENSHOT_BYTES:
+        raise ValueError("可视化 PNG 尺寸无效")
+    with path.open("rb") as handle:
+        signature = handle.read(8)
+    if signature != _PNG_SIGNATURE:
+        raise ValueError("可视化 PNG 签名无效")
 
 
 def _project_record(record: dict[str, Any] | None, event_type: str) -> dict[str, str]:
@@ -852,16 +993,33 @@ def _project_record(record: dict[str, Any] | None, event_type: str) -> dict[str,
     return projected
 
 
-def _record_rows(record: dict[str, str], *, empty_text: str) -> str:
-    if not record:
-        return f'<div class="empty">{_e(empty_text)}</div>'
-    rows = []
-    for key, value in list(record.items())[:12]:
-        label = _FIELD_LABELS.get(key, key)
+def _compare_rows(
+    own: dict[str, str],
+    other: dict[str, str],
+    *,
+    changed_side: str,
+) -> str:
+    if not own:
+        return (
+            '<div class="prow"><span class="pkey">—</span>'
+            '<span class="pval none"></span></div>'
+        )
+    rows: list[str] = []
+    for key, value in list(own.items())[:_MAX_COMPARE_ROWS]:
+        changed = other.get(key) != value
+        other_missing = key not in other
+        if changed_side == "before":
+            emphasis = "cut" if changed else ""
+        else:
+            emphasis = "hot" if changed else ""
+        if other_missing and changed_side == "after":
+            emphasis = "hot"
+        if other_missing and changed_side == "before":
+            emphasis = "cut"
         rows.append(
-            '<div class="row">'
-            f'<span class="key">{_e(label)}</span>'
-            f'<span class="value">{_e(value)}</span>'
+            '<div class="prow">'
+            f'<span class="pkey">{_e(_FIELD_LABELS.get(key, key))}</span>'
+            f'<span class="pval {_e(emphasis)}">{_e(value)}</span>'
             "</div>"
         )
     return "".join(rows)
@@ -869,7 +1027,7 @@ def _record_rows(record: dict[str, str], *, empty_text: str) -> str:
 
 def _subject(record: dict[str, str], event_type: str) -> str:
     if not record:
-        return _EVENT_LABELS.get(event_type, ("", "配置变化", ""))[1]
+        return _EVENT_LABELS.get(event_type, _FALLBACK_EVENT)[1]
     value = (
         record.get("name")
         or record.get("product_name")
@@ -884,7 +1042,22 @@ def _subject(record: dict[str, str], event_type: str) -> str:
     return _clip(value, 120)
 
 
-def _primary_rate_value(record: dict[str, str]) -> str:
+def _subject_label(record: dict[str, Any]) -> str:
+    value = (
+        record.get("name")
+        or record.get("product_name")
+        or record.get("productName")
+        or record.get("group_name")
+        or record.get("groupName")
+        or record.get("slug")
+        or record.get("id")
+    )
+    return _clip(value, 60) if value not in (None, "") else ""
+
+
+def _primary_rate_value(record: dict[str, Any] | dict[str, str]) -> Any:
+    if not isinstance(record, dict):
+        return None
     for key in (
         "rate_multiplier",
         "rate",
@@ -897,9 +1070,85 @@ def _primary_rate_value(record: dict[str, str]) -> str:
         "weight",
         "value",
     ):
-        if record.get(key):
-            return record[key]
-    return "—"
+        value = record.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _finite_rate(value: Any) -> float | None:
+    if isinstance(value, bool) or value in (None, ""):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _fmt_rate(value: float) -> str:
+    text = f"{value:g}"
+    return text
+
+
+def _rate_tone(value: float | None) -> str:
+    if value is None:
+        return "dim"
+    if value <= 0.5:
+        return "good"
+    if value <= 1.5:
+        return "moon"
+    if value <= 3.0:
+        return "warn"
+    return "bad"
+
+
+def _rate_direction(
+    before: dict[str, Any] | None, after: dict[str, Any] | None
+) -> str:
+    old = _finite_rate(_primary_rate_value(before or {}))
+    new = _finite_rate(_primary_rate_value(after or {}))
+    if old is None or new is None or old == new:
+        return "flat"
+    return "up" if new > old else "down"
+
+
+def _price_html(record: dict[str, Any]) -> str:
+    raw_price = record.get("price")
+    currency = str(record.get("currency") or "").strip().upper()
+    symbols = {"CNY": "¥", "RMB": "¥", "USD": "$", "EUR": "€", "JPY": "¥"}
+    symbol = symbols.get(currency, "")
+    period = (
+        record.get("period")
+        or record.get("billing_cycle")
+        or record.get("billingCycle")
+        or record.get("duration")
+    )
+    price_text = ""
+    if raw_price not in (None, ""):
+        parsed = _finite_rate(raw_price)
+        if parsed is None:
+            price_text = _clip(raw_price, 12)
+        else:
+            amount = f"{parsed:g}" if parsed == int(parsed) else f"{parsed:.2f}"
+            price_text = f"{symbol}{amount}" if symbol else f"{_clip(currency, 4)} {amount}".strip()
+    else:
+        price_text = "—"
+    period_text = f"/ {_clip(period, 10)}" if period else ""
+    return (
+        f'<div class="val price t-moon">{_e(price_text)}</div>'
+        f'<div class="period">{_e(period_text)}</div>'
+    )
+
+
+def _empty_state(title: str, subtitle: str) -> str:
+    return (
+        '<div class="empty">'
+        f"{_icon('layers')}"
+        f"<b>{_e(title)}</b>"
+        f"<small>{_e(subtitle)}</small>"
+        "</div>"
+    )
 
 
 def _timestamp(value: int | None) -> str:
@@ -908,17 +1157,7 @@ def _timestamp(value: int | None) -> str:
         moment = datetime.fromtimestamp(timestamp, tz=timezone.utc)
     except (OverflowError, OSError, ValueError):
         moment = datetime.now(tz=timezone.utc)
-    return moment.strftime("%Y-%m-%d %H:%M:%S UTC")
-
-
-def _timestamp_or_waiting(value: Any) -> str:
-    if isinstance(value, bool):
-        return "尚未成功"
-    try:
-        timestamp = int(value)
-    except (TypeError, ValueError, OverflowError):
-        return "尚未成功"
-    return _timestamp(timestamp)
+    return moment.strftime("%Y-%m-%d %H:%M UTC")
 
 
 def _bounded_nonnegative_int(value: Any) -> int:
@@ -932,9 +1171,7 @@ def _bounded_nonnegative_int(value: Any) -> int:
 
 
 def _document(css: str, body: str) -> str:
-    csp = (
-        "default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; font-src 'none'"
-    )
+    csp = "default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; font-src 'none'"
     return (
         '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
         f'<meta http-equiv="Content-Security-Policy" content="{csp}">'
