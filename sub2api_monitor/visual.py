@@ -1,8 +1,8 @@
-"""Safe, local-only Playwright visualizations for the Sub2API monitor.
+"""Safe, local-only Ukiyo-e visualizations for the Sub2API monitor.
 
-Visual language: dark signal-telemetry. Deep-ink canvas, moon-white display
-type, hairline blueprint grid, oversized tabular numerals, Lucide stroke
-icons. All rendering is local (network blocked, JS disabled, CSP enforced).
+Reports use opaque washi paper, indigo outlines, vermilion seals, gold fields,
+and hard-edged woodblock shadows. All rendering is local (network blocked,
+JavaScript disabled, CSP enforced).
 """
 
 from __future__ import annotations
@@ -183,9 +183,9 @@ _ICONS: dict[str, str] = {
 def _icon(name: str, cls: str = "") -> str:
     """Render one Lucide icon as an inline stroke SVG."""
     body = _ICONS.get(name) or _ICONS["activity"]
-    klass = f' class="{_e(cls)}"' if cls else ""
+    css_class = " ".join(part for part in ("ic", cls) if part)
     return (
-        f'<svg{klass} viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+        f'<svg class="{_e(css_class)}" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
         'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" '
         'aria-hidden="true">'
         f"{body}</svg>"
@@ -194,288 +194,380 @@ def _icon(name: str, cls: str = "") -> str:
 
 _BASE_CSS = """
 :root {
-  --ink: #0a0d12;
-  --ink2: #0e131b;
-  --ink3: #131a26;
-  --line: #1b2330;
-  --line2: #2b3648;
-  --text: #edf2f7;
-  --dim: #8b96a5;
-  --faint: #5a6675;
-  --moon: #c9daee;
-  --good: #4ade9c;
-  --warn: #f5c044;
-  --bad: #ff6b6b;
-  --sans: "PingFang SC", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
-  --mono: "Cascadia Mono", "SF Mono", "JetBrains Mono", Consolas, ui-monospace,
-    "Microsoft YaHei", monospace;
+  --paper: #f5f0e1;
+  --indigo: #1a3055;
+  --vermilion: #d4553a;
+  --gold: #c9a227;
+  --wave: #2a5a8c;
+  --ink: #1a3055;
+  --ink2: #f5f0e1;
+  --ink3: #c9a227;
+  --line: #1a3055;
+  --line2: #1a3055;
+  --text: #1a3055;
+  --dim: #1a3055;
+  --faint: #1a3055;
+  --moon: #1a3055;
+  --good: #1a3055;
+  --warn: #c9a227;
+  --bad: #d4553a;
+  --sans: "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  --display: "Songti SC", "STSong", "SimSun", serif;
+  --mono: "Cascadia Mono", Consolas, "Microsoft YaHei", monospace;
 }
 * { box-sizing: border-box; }
-html, body { margin: 0; background: transparent; color: var(--text); }
-body {
-  padding: 0;
-  font-family: var(--sans);
-  -webkit-font-smoothing: antialiased;
-}
+html, body { margin: 0; background: var(--paper); color: var(--indigo); }
+body { padding: 0; font-family: var(--sans); }
 article {
   position: relative;
   width: 620px;
   overflow: hidden;
-  background:
-    repeating-linear-gradient(0deg, rgba(255,255,255,.018) 0 1px, transparent 1px 28px),
-    repeating-linear-gradient(90deg, rgba(255,255,255,.018) 0 1px, transparent 1px 28px),
-    var(--ink);
-  border: 1px solid var(--line2);
+  background: var(--paper);
+  border: 3px solid var(--indigo);
+  box-shadow: 6px 6px 0 var(--indigo);
 }
-article::before {
-  position: absolute;
-  inset: 0 auto 0 0;
-  width: 3px;
-  content: "";
-  background: linear-gradient(180deg, var(--moon), rgba(201,218,238,0) 70%);
+svg.ic { width: 13px; height: 13px; flex: none; }
+.wave {
+  display: block;
+  width: 100%;
+  height: 25px;
+  color: var(--wave);
+  background: var(--gold);
+  border-top: 2px solid var(--indigo);
+  border-bottom: 2px solid var(--indigo);
 }
-svg.ic { width: 12px; height: 12px; flex: none; }
+.wave svg { display: block; width: 100%; height: 100%; }
 .brand {
   position: relative;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 14px 22px;
-  border-bottom: 1px solid var(--line);
-  color: var(--faint);
-  font: 600 9.5px/1 var(--mono);
-  letter-spacing: .2em;
+  gap: 12px;
+  padding: 12px 18px;
+  background: var(--indigo);
+  border-bottom: 3px solid var(--indigo);
+  color: var(--paper);
+  font: 700 10px/1 var(--mono);
+  letter-spacing: .16em;
 }
-.brand span { display: inline-flex; align-items: center; gap: 7px; }
+.brand span {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .foot {
   position: relative;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
-  padding: 13px 22px;
-  border-top: 1px solid var(--line);
-  color: var(--faint);
-  font: 600 9px/1.5 var(--mono);
-  letter-spacing: .16em;
+  gap: 12px;
+  padding: 12px 18px;
+  background: var(--gold);
+  border-top: 3px solid var(--indigo);
+  color: var(--indigo);
+  font: 700 9px/1.35 var(--mono);
+  letter-spacing: .1em;
   white-space: nowrap;
 }
+.foot span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .head {
   position: relative;
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: end;
   gap: 18px;
-  padding: 24px 22px 20px;
+  padding: 17px 18px 14px;
+  background: var(--paper);
 }
 .kicker {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  color: var(--dim);
-  font: 700 10px/1 var(--mono);
-  letter-spacing: .24em;
+  gap: 7px;
+  color: var(--vermilion);
+  font: 800 10px/1 var(--mono);
+  letter-spacing: .16em;
 }
 h1 {
-  margin: 10px 0 0;
-  overflow-wrap: anywhere;
-  color: var(--text);
-  font-size: 30px;
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--indigo);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--display);
+  font-size: 31px;
   font-weight: 800;
-  letter-spacing: -.03em;
-  line-height: 1.08;
+  letter-spacing: .08em;
+  line-height: 1.16;
 }
 .count {
-  color: var(--moon);
-  font: 700 42px/1 var(--mono);
+  color: var(--vermilion);
+  font: 800 40px/1 var(--mono);
   font-variant-numeric: tabular-nums;
-  letter-spacing: -.04em;
+  letter-spacing: -.06em;
   text-align: right;
 }
 .count small {
   margin-left: 3px;
-  color: var(--faint);
-  font-size: 15px;
-  font-weight: 600;
+  color: var(--indigo);
+  font-size: 14px;
+  font-weight: 800;
 }
 .count-label {
-  margin-top: 6px;
-  color: var(--faint);
-  font: 600 8.5px/1 var(--mono);
-  letter-spacing: .22em;
+  margin-top: 5px;
+  color: var(--indigo);
+  font: 800 8.5px/1 var(--mono);
+  letter-spacing: .14em;
   text-align: right;
 }
 """
 
-_BOARD_CSS = _BASE_CSS + """
-.rows { position: relative; padding: 4px 22px 12px; }
+_BOARD_CSS = (
+    _BASE_CSS
+    + """
+.rows { position: relative; padding: 0 18px 12px; }
 .row {
   display: grid;
-  grid-template-columns: 26px 1fr auto;
-  align-items: center;
-  gap: 12px;
-  padding: 10.5px 0;
-  border-top: 1px solid var(--line);
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 10px;
+  padding: 12px 0;
+  border-top: 2px solid var(--indigo);
 }
 .rows .row:first-child { border-top: 0; }
-.idx { color: var(--faint); font: 600 9.5px/1 var(--mono); letter-spacing: .1em; }
+.idx {
+  display: grid;
+  place-items: center;
+  min-height: 25px;
+  background: var(--gold);
+  border: 2px solid var(--indigo);
+  color: var(--indigo);
+  font: 800 9px/1 var(--mono);
+  letter-spacing: .06em;
+}
 .who { min-width: 0; }
 .name {
   display: flex;
   align-items: center;
-  gap: 8px;
-  overflow: hidden;
-  font-size: 14.5px;
-  font-weight: 650;
-  line-height: 1.25;
+  gap: 7px;
+  min-width: 0;
+  color: var(--indigo);
+  font-size: 15px;
+  font-weight: 800;
+  line-height: 1.3;
   white-space: nowrap;
 }
-.name b {
-  overflow: hidden;
-  max-width: 330px;
-  text-overflow: ellipsis;
-}
-.chip {
+.name b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip, .seal {
+  display: inline-flex;
+  align-items: center;
   flex: none;
-  padding: 2.5px 6px;
-  border: 1px solid var(--line2);
-  color: var(--faint);
-  font: 600 8.5px/1 var(--mono);
-  letter-spacing: .14em;
+  min-height: 20px;
+  padding: 3px 5px;
+  border: 2px solid var(--indigo);
+  background: var(--paper);
+  color: var(--indigo);
+  font: 800 8px/1 var(--mono);
+  letter-spacing: .08em;
+  font-style: normal;
   text-transform: uppercase;
 }
-.chip.t-warn { border-color: rgba(245,192,68,.4); color: var(--warn); }
-.chip.t-good { border-color: rgba(74,222,156,.4); color: var(--good); }
-.chip.t-bad { border-color: rgba(255,107,107,.4); color: var(--bad); }
-.track { height: 3px; margin-top: 7px; overflow: hidden; background: var(--ink3); }
-.track i { display: block; height: 100%; min-width: 2px; }
-.track .t-good { background: var(--good); }
-.track .t-warn { background: var(--warn); }
-.track .t-bad { background: var(--bad); }
-.track .t-moon { background: var(--moon); }
-.val {
-  color: var(--text);
-  font: 700 24px/1 var(--mono);
-  font-variant-numeric: tabular-nums;
-  letter-spacing: -.03em;
+.seal { background: var(--vermilion); color: var(--paper); box-shadow: 2px 2px 0 var(--indigo); }
+.chip.t-warn { background: var(--gold); color: var(--indigo); }
+.chip.t-good { background: var(--wave); color: var(--paper); }
+.chip.t-bad { background: var(--vermilion); color: var(--paper); }
+.details {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 5px 10px;
+  min-width: 0;
+  overflow: hidden;
+  margin-top: 7px;
+  color: var(--indigo);
+  font: 700 9px/1.35 var(--mono);
+  letter-spacing: .02em;
   white-space: nowrap;
 }
-.val i {
-  margin-left: 2px;
-  color: var(--faint);
-  font-style: normal;
-  font-size: 12px;
-}
-.val.price { font-size: 20px; }
-.period {
-  margin-top: 4px;
-  color: var(--faint);
-  font: 600 9px/1 var(--mono);
-  letter-spacing: .12em;
+.details span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.details b { color: var(--vermilion); font-weight: 800; }
+.track { height: 6px; margin-top: 8px; border: 2px solid var(--indigo); background: var(--paper); }
+.track i { display: block; height: 100%; min-width: 2px; background: var(--wave); }
+.track .t-good { background: var(--wave); }
+.track .t-warn { background: var(--gold); }
+.track .t-bad { background: var(--vermilion); }
+.track .t-moon { background: var(--indigo); }
+.val {
+  padding-top: 1px;
+  color: var(--vermilion);
+  font: 800 23px/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -.05em;
   text-align: right;
+  white-space: nowrap;
 }
-.t-good { color: var(--good); }
-.t-warn { color: var(--warn); }
-.t-bad { color: var(--bad); }
-.t-moon { color: var(--moon); }
-.t-dim { color: var(--dim); }
-.more {
-  padding: 10px 22px 2px;
-  color: var(--faint);
-  font: 600 9.5px/1 var(--mono);
-  letter-spacing: .16em;
-}
+.val i { margin-left: 2px; color: var(--indigo); font-style: normal; font-size: 12px; }
+.val.price { font-size: 20px; }
+.period { margin-top: 4px; color: var(--indigo); font: 800 8.5px/1.3 var(--mono); letter-spacing: .06em; text-align: right; white-space: nowrap; }
+.t-good { color: var(--wave); }
+.t-warn { color: var(--gold); }
+.t-bad { color: var(--vermilion); }
+.t-moon { color: var(--indigo); }
+.t-dim { color: var(--indigo); }
+.more { padding: 10px 18px 2px; color: var(--vermilion); font: 800 9.5px/1.2 var(--mono); letter-spacing: .1em; }
 .empty {
   display: grid;
   place-items: center;
   gap: 10px;
-  margin: 4px 22px 14px;
-  padding: 34px 20px;
-  border: 1px dashed var(--line2);
+  margin: 10px 18px 16px;
+  padding: 28px 18px;
+  border: 3px dashed var(--indigo);
+  background: var(--gold);
+  color: var(--indigo);
   text-align: center;
 }
-.empty svg.ic { width: 20px; height: 20px; color: var(--faint); }
-.empty b { color: var(--dim); font: 600 11px/1 var(--mono); letter-spacing: .2em; }
-.empty small { color: var(--faint); font: 500 9px/1.6 var(--mono); letter-spacing: .12em; }
+.empty svg.ic { width: 20px; height: 20px; }
+.empty b { font: 800 11px/1 var(--mono); letter-spacing: .14em; }
+.empty small { font: 700 9px/1.5 var(--mono); letter-spacing: .08em; }
 """
+)
 
-_CARD_CSS = _BASE_CSS + """
+_CARD_CSS = (
+    _BASE_CSS
+    + """
 .event {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 10px;
-  border: 1px solid var(--line2);
-  font: 700 9.5px/1 var(--mono);
-  letter-spacing: .2em;
+  gap: 7px;
+  padding: 6px 8px;
+  border: 2px solid var(--indigo);
+  background: var(--gold);
+  color: var(--indigo);
+  font: 800 9px/1 var(--mono);
+  letter-spacing: .12em;
 }
 .event svg.ic { width: 11px; height: 11px; }
-.event.t-good { border-color: rgba(74,222,156,.45); color: var(--good); background: rgba(74,222,156,.07); }
-.event.t-warn { border-color: rgba(245,192,68,.45); color: var(--warn); background: rgba(245,192,68,.07); }
-.event.t-bad { border-color: rgba(255,107,107,.45); color: var(--bad); background: rgba(255,107,107,.07); }
-.meta {
-  margin-top: 9px;
-  color: var(--faint);
-  font: 600 9.5px/1.6 var(--mono);
-  letter-spacing: .14em;
-}
+.event.t-good { background: var(--wave); color: var(--paper); }
+.event.t-warn { background: var(--gold); color: var(--indigo); }
+.event.t-bad { background: var(--vermilion); color: var(--paper); }
+.meta { margin-top: 9px; color: var(--indigo); font: 800 9px/1.5 var(--mono); letter-spacing: .08em; }
 .compare {
   position: relative;
   display: grid;
-  grid-template-columns: 1fr 52px 1fr;
+  grid-template-columns: 1fr 44px 1fr;
   align-items: stretch;
-  padding: 2px 22px 16px;
+  padding: 0 18px 16px;
 }
-.panel {
-  min-width: 0;
-  padding: 14px 15px 12px;
-  border: 1px solid var(--line);
-  background: var(--ink2);
-}
-.panel.after { border-color: var(--line2); background: var(--ink3); }
-.ptitle {
-  display: flex;
-  justify-content: space-between;
-  margin-bottom: 6px;
-  color: var(--faint);
-  font: 700 8.5px/1 var(--mono);
-  letter-spacing: .2em;
-}
-.prow {
-  display: grid;
-  grid-template-columns: 82px 1fr;
-  gap: 10px;
-  align-items: baseline;
-  padding: 7px 0;
-  border-top: 1px solid var(--line);
-  font-size: 12.5px;
-  line-height: 1.4;
-}
+.panel { min-width: 0; padding: 12px; border: 3px solid var(--indigo); background: var(--paper); }
+.panel.after { background: var(--gold); }
+.ptitle { display: flex; justify-content: space-between; margin-bottom: 6px; color: var(--vermilion); font: 800 8.5px/1 var(--mono); letter-spacing: .12em; }
+.prow { display: grid; grid-template-columns: 76px 1fr; gap: 8px; align-items: baseline; padding: 7px 0; border-top: 2px solid var(--indigo); font-size: 12px; line-height: 1.35; }
 .prow:first-of-type { border-top: 0; }
-.pkey {
-  overflow: hidden;
-  color: var(--faint);
-  font: 600 9.5px/1.4 var(--mono);
-  letter-spacing: .06em;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.pval { overflow-wrap: anywhere; color: var(--dim); font-variant-numeric: tabular-nums; }
-.pval.cut { color: var(--faint); text-decoration: line-through; }
-.pval.hot { color: var(--moon); font-weight: 700; }
-.pval.none::before { content: "\\2014"; color: var(--faint); }
+.pkey { overflow: hidden; color: var(--indigo); font: 800 9px/1.3 var(--mono); letter-spacing: .04em; text-overflow: ellipsis; white-space: nowrap; }
+.pval { overflow-wrap: anywhere; color: var(--indigo); font-variant-numeric: tabular-nums; }
+.pval.cut { color: var(--vermilion); text-decoration: line-through; }
+.pval.hot { color: var(--vermilion); font-weight: 800; }
+.pval.none::before { content: "无"; color: var(--indigo); }
 .mid { display: grid; place-items: center; }
-.ring {
-  display: grid;
-  place-items: center;
-  width: 34px;
-  height: 34px;
-  border: 1px solid var(--line2);
-  border-radius: 50%;
-  color: var(--moon);
-}
-.ring svg.ic { width: 15px; height: 15px; }
+.ring { display: grid; place-items: center; width: 30px; height: 30px; border: 3px solid var(--indigo); background: var(--vermilion); color: var(--paper); box-shadow: 2px 2px 0 var(--indigo); }
+.ring svg.ic { width: 14px; height: 14px; }
 """
+)
+
+
+def _wave_motif() -> str:
+    """Return a solid, woodblock-style wave band shared by every report."""
+    return (
+        '<div class="wave" aria-hidden="true"><svg viewBox="0 0 620 26" '
+        'preserveAspectRatio="none"><path d="M0 18 C24 4 46 4 70 18 '
+        "S116 32 140 18 S186 4 210 18 S256 32 280 18 S326 4 350 18 "
+        'S396 32 420 18 S466 4 490 18 S536 32 560 18 S596 4 620 18" '
+        'fill="none" stroke="currentColor" stroke-width="4"/></svg></div>'
+    )
+
+
+def _safe_scalar(record: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = record.get(key)
+        if value not in (None, "") and not isinstance(value, (dict, list, tuple, set)):
+            return _clip(value, 28)
+    return ""
+
+
+def _detail_html(items: list[tuple[str, str]]) -> str:
+    visible = [(label, value) for label, value in items if value]
+    if not visible:
+        return ""
+    return (
+        '<div class="details">'
+        + "".join(
+            f"<span><b>{_e(label)}</b>{_e(value)}</span>"
+            for label, value in visible[:5]
+        )
+        + "</div>"
+    )
+
+
+def _subscription_details(record: dict[str, Any]) -> str:
+    return _detail_html(
+        [
+            ("编号 ", _safe_scalar(record, "id", "subscription_id", "subscriptionId")),
+            ("套餐 ", _safe_scalar(record, "plan", "plan_name", "plan_id", "planId")),
+            ("额度 ", _safe_scalar(record, "quota", "limit", "capacity")),
+            ("库存 ", _safe_scalar(record, "stock", "remaining", "available")),
+            ("到期 ", _safe_scalar(record, "expires_at", "expire_at", "expired_at")),
+        ]
+    )
+
+
+def _rate_details(record: dict[str, Any]) -> str:
+    peak_start = _safe_scalar(record, "peak_start", "peakStart")
+    peak_end = _safe_scalar(record, "peak_end", "peakEnd")
+    peak_window = f"{peak_start} 至 {peak_end}" if peak_start and peak_end else ""
+    peak_enabled = _safe_scalar(record, "peak_rate_enabled", "peakRateEnabled")
+    peak = peak_window or (
+        "已启用" if peak_enabled.casefold() in {"true", "1", "yes"} else ""
+    )
+    return _detail_html(
+        [
+            ("输入 ", _safe_scalar(record, "input_ratio", "inputRatio")),
+            (
+                "输出 ",
+                _safe_scalar(
+                    record,
+                    "output_ratio",
+                    "outputRatio",
+                    "completion_ratio",
+                    "completionRatio",
+                ),
+            ),
+            ("模型 ", _safe_scalar(record, "model_ratio", "modelRatio")),
+            ("峰值 ", peak),
+        ]
+    )
+
+
+def _subscription_status(record: dict[str, Any]) -> tuple[str, str]:
+    enabled = record.get("enabled")
+    raw = _safe_scalar(record, "status")
+    inactive = {"inactive", "disabled", "false", "0", "offline", "sold_out"}
+    active = {"active", "enabled", "true", "1", "online", "available"}
+    if enabled is False or raw.casefold() in inactive:
+        return "已停用", "bad"
+    if enabled is True or raw.casefold() in active:
+        return "可用", "good"
+    return (raw, "warn") if raw else ("", "")
+
+
+def _safe_error_text(value: Any) -> str:
+    """Return a clipped error summary without credential-like fragments."""
+    text = str(redact(value) if value is not None else "")
+    return re.sub(
+        r"(?i)(?:password|passwd|token|secret|api[_-]?key|authorization)\s*[:=]\s*[^\s,;]+",
+        "[已隐藏]",
+        text,
+    )
 
 
 def build_rates_html(
@@ -485,67 +577,69 @@ def build_rates_html(
     records: list[dict[str, Any]],
     generated_at: int | None = None,
 ) -> str:
-    """Build the group-rates board: indexed rows, proportional bars, big numerals."""
-    parsed: list[tuple[float | None, str, str, str]] = []
-    for record in records[:_MAX_BOARD_ROWS + 40]:
+    """Build a Ukiyo-e group-rate query board with operational detail."""
+    parsed: list[tuple[float | None, dict[str, Any], str, str]] = []
+    for record in records[: _MAX_BOARD_ROWS + 40]:
         if not isinstance(record, dict):
             continue
-        label = _subject_label(record)
-        platform = str(record.get("platform") or "").strip()
-        status = str(record.get("status") or "").strip().casefold()
-        value = _finite_rate(_primary_rate_value(record))
-        parsed.append((value, label, platform, status))
-    parsed = [item for item in parsed if item[1]]
-    parsed.sort(key=lambda item: (item[0] is None, item[0] if item[0] is not None else 0.0))
+        cleaned = redact(record)
+        if not isinstance(cleaned, dict):
+            continue
+        label = _subject_label(cleaned)
+        if label:
+            parsed.append(
+                (
+                    _finite_rate(_primary_rate_value(cleaned)),
+                    cleaned,
+                    label,
+                    _safe_scalar(cleaned, "platform"),
+                )
+            )
+    parsed.sort(
+        key=lambda item: (item[0] is None, item[0] if item[0] is not None else 0.0)
+    )
     shown = parsed[:_MAX_BOARD_ROWS]
     omitted = max(0, len(parsed) - len(shown))
     finite_values = [value for value, *_rest in shown if value is not None]
     peak = max(finite_values) if finite_values else 0.0
 
     rows: list[str] = []
-    for index, (value, label, platform, status) in enumerate(shown, start=1):
+    for index, (value, record, label, platform) in enumerate(shown, start=1):
         tone = _rate_tone(value)
-        chip = f'<em class="chip">{_e(_clip(platform, 18))}</em>' if platform else ""
-        if status and status not in {"active", "enabled", "true", "1"}:
-            chip += f'<em class="chip t-warn">{_e(_clip(status, 16))}</em>'
+        chips = f'<em class="chip">{_e(platform)}</em>' if platform else ""
         if value is None:
-            row = (
-                '<div class="row">'
-                f'<span class="idx">{index:02d}</span>'
-                f'<div class="who"><div class="name"><b>{_e(_clip(label, 44))}</b>{chip}</div></div>'
-                '<span class="val t-dim">—</span>'
-                "</div>"
-            )
+            value_html = '<span class="val t-dim">无</span>'
+            track_html = ""
         else:
             width = 2 if peak <= 0 else max(2, round(value / peak * 100))
-            row = (
-                '<div class="row">'
-                f'<span class="idx">{index:02d}</span>'
-                f'<div class="who"><div class="name"><b>{_e(_clip(label, 44))}</b>{chip}</div>'
-                f'<div class="track"><i class="t-{tone}" style="width:{width}%"></i></div></div>'
-                f'<span class="val t-{tone}">{_fmt_rate(value)}<i>×</i></span>'
-                "</div>"
-            )
-        rows.append(row)
+            value_html = f'<span class="val t-{tone}">{_fmt_rate(value)}<i>×</i></span>'
+            track_html = f'<div class="track"><i class="t-{tone}" style="width:{width}%"></i></div>'
+        rows.append(
+            '<div class="row">'
+            f'<span class="idx">{index:02d}</span>'
+            f'<div class="who"><div class="name"><b>{_e(_clip(label, 44))}</b>{chips}</div>'
+            f"{_rate_details(record)}{track_html}</div>{value_html}"
+            "</div>"
+        )
     rows_html = "".join(rows) or _empty_state("NO RATES CAPTURED", "尚未捕获任何分组倍率")
-    more_html = f'<div class="more">+ {omitted} MORE / 其余分组未展示</div>' if omitted else ""
+    more_html = f'<div class="more">另有 {omitted} 个分组未展示</div>' if omitted else ""
     body = (
         '<article id="sub2api-board">'
         '<header class="brand">'
-        f'<span>{_icon("activity")} SIRIUS PULSE / SUB2API</span>'
-        f'<span>{_icon("clock")} {_e(_timestamp(generated_at))}</span>'
+        "<span>GROUP RATES / 分组倍率</span>"
+        f"<span>{_e(_timestamp(generated_at))}</span>"
         "</header>"
+        f"{_wave_motif()}"
         '<header class="head">'
-        '<div><div class="kicker">'
-        f'{_icon("percent")} GROUP RATES / 分组倍率</div>'
-        f"<h1>{_e(_clip(display_name, 40))}</h1></div>"
-        f'<div><div class="count">{len(parsed)}<small>G</small></div>'
-        '<div class="count-label">GROUPS / 分组</div></div>'
+        f"<div><h1>{_e(_clip(display_name, 40))}</h1></div>"
+        f'<div><div class="count">{len(parsed)}<small>组</small></div>'
+        '<div class="count-label">可用分组</div></div>'
         "</header>"
         f'<section class="rows">{rows_html}</section>{more_html}'
+        f"{_wave_motif()}"
         '<footer class="foot">'
-        f"<span>SOURCE / {_e(_clip(source_id.upper(), 24))}</span>"
-        "<span>LOCAL RENDER · APPROVED FIELDS</span>"
+        f"<span>站点 / {_e(_clip(source_id.upper(), 24))}</span>"
+        "<span>倍率含输入、输出、模型与峰值信息</span>"
         "</footer></article>"
     )
     return _document(_BOARD_CSS, body)
@@ -558,65 +652,52 @@ def build_subscriptions_html(
     records: list[dict[str, Any]],
     generated_at: int | None = None,
 ) -> str:
-    """Build the subscriptions board: name, price, cycle, status."""
-    parsed: list[dict[str, str]] = []
-    for record in records[:_MAX_BOARD_ROWS + 40]:
+    """Build a Ukiyo-e subscription query board with decision-useful fields."""
+    parsed: list[dict[str, Any]] = []
+    for record in records[: _MAX_BOARD_ROWS + 40]:
         if not isinstance(record, dict):
             continue
-        cleaned = redact(record) if isinstance(record, dict) else None
-        if not isinstance(cleaned, dict):
-            continue
-        label = _subject_label(cleaned)
-        if not label:
-            continue
-        parsed.append(cleaned)
+        cleaned = redact(record)
+        if isinstance(cleaned, dict) and _subject_label(cleaned):
+            parsed.append(cleaned)
     shown = parsed[:_MAX_BOARD_ROWS]
     omitted = max(0, len(parsed) - len(shown))
 
     rows: list[str] = []
     for index, record in enumerate(shown, start=1):
         label = _subject_label(record)
-        group = (
-            record.get("group_name")
-            or record.get("groupName")
-            or record.get("group_id")
-            or record.get("groupId")
-        )
-        status = str(record.get("status") or "").strip()
-        enabled = record.get("enabled")
-        chips = ""
-        if group:
-            chips += f'<em class="chip">{_e(_clip(group, 20))}</em>'
-        status_text = status or ("active" if enabled is True else "")
-        if status_text and status_text.casefold() not in {"active", "enabled", "true", "1"}:
-            chips += f'<em class="chip t-warn">{_e(_clip(status_text, 16))}</em>'
-        price_html = _price_html(record)
+        group = _safe_scalar(record, "group_name", "groupName", "group_id", "groupId")
+        status_text, status_tone = _subscription_status(record)
+        chips = f'<em class="chip">{_e(group)}</em>' if group else ""
+        if status_text:
+            chips += f'<em class="chip t-{status_tone}">{_e(status_text)}</em>'
         rows.append(
             '<div class="row">'
             f'<span class="idx">{index:02d}</span>'
-            f'<div class="who"><div class="name"><b>{_e(_clip(label, 44))}</b>{chips}</div></div>'
-            f"<div>{price_html}</div>"
+            f'<div class="who"><div class="name"><b>{_e(_clip(label, 44))}</b>{chips}</div>'
+            f"{_subscription_details(record)}</div>"
+            f"<div>{_price_html(record)}</div>"
             "</div>"
         )
     rows_html = "".join(rows) or _empty_state("NO SUBSCRIPTIONS", "暂无可售订阅")
-    more_html = f'<div class="more">+ {omitted} MORE / 其余订阅未展示</div>' if omitted else ""
+    more_html = f'<div class="more">另有 {omitted} 个订阅未展示</div>' if omitted else ""
     body = (
         '<article id="sub2api-board">'
         '<header class="brand">'
-        f'<span>{_icon("activity")} SIRIUS PULSE / SUB2API</span>'
-        f'<span>{_icon("clock")} {_e(_timestamp(generated_at))}</span>'
+        "<span>SUBSCRIPTIONS / 可售订阅</span>"
+        f"<span>{_e(_timestamp(generated_at))}</span>"
         "</header>"
+        f"{_wave_motif()}"
         '<header class="head">'
-        '<div><div class="kicker">'
-        f'{_icon("credit-card")} SUBSCRIPTIONS / 可售订阅</div>'
-        f"<h1>{_e(_clip(display_name, 40))}</h1></div>"
-        f'<div><div class="count">{len(parsed)}<small>S</small></div>'
-        '<div class="count-label">ITEMS / 订阅</div></div>'
+        f"<div><h1>{_e(_clip(display_name, 40))}</h1></div>"
+        f'<div><div class="count">{len(parsed)}<small>项</small></div>'
+        '<div class="count-label">订阅目录</div></div>'
         "</header>"
         f'<section class="rows">{rows_html}</section>{more_html}'
+        f"{_wave_motif()}"
         '<footer class="foot">'
-        f"<span>SOURCE / {_e(_clip(source_id.upper(), 24))}</span>"
-        "<span>LOCAL RENDER · APPROVED FIELDS</span>"
+        f"<span>站点 / {_e(_clip(source_id.upper(), 24))}</span>"
+        "<span>价格、周期、套餐、额度、库存与到期</span>"
         "</footer></article>"
     )
     return _document(_BOARD_CSS, body)
@@ -631,7 +712,7 @@ def build_change_card_html(
     after: dict[str, Any] | None,
     occurred_at: int | None = None,
 ) -> str:
-    """Build a dark before/after change card containing only approved fields."""
+    """Build a Ukiyo-e before/after change card from approved fields only."""
     code, title, tone, icon = _EVENT_LABELS.get(event_type, _FALLBACK_EVENT)
     if event_type == "rate_changed":
         direction = _rate_direction(before, after)
@@ -642,10 +723,6 @@ def build_change_card_html(
     before_clean = _project_record(before, event_type)
     after_clean = _project_record(after, event_type)
     subject = _subject(after_clean or before_clean, event_type)
-    keys: list[str] = []
-    for key in (*before_clean, *after_clean):
-        if key not in keys:
-            keys.append(key)
     before_rows = _compare_rows(before_clean, after_clean, changed_side="before")
     after_rows = _compare_rows(after_clean, before_clean, changed_side="after")
     body = (
@@ -654,25 +731,87 @@ def build_change_card_html(
         f'<span>{_icon("activity")} SIRIUS PULSE / SUB2API</span>'
         f'<span>{_icon("clock")} {_e(_timestamp(occurred_at))}</span>'
         "</header>"
+        f"{_wave_motif()}"
         '<header class="head">'
-        f'<div><span class="event t-{tone}">{_icon(icon)} {_e(code)} — {_e(title)}</span>'
+        f'<div><span class="event t-{tone}">{_icon(icon)} {_e(code)} / {_e(title)}</span>'
         f"<h1>{_e(subject)}</h1>"
-        f'<div class="meta">SOURCE / {_e(_clip(display_name, 48))}'
-        f' · {_e(_clip(source_id.upper(), 24))}</div></div>'
+        f'<div class="meta">站点 / {_e(_clip(display_name, 48))}'
+        f" · {_e(_clip(source_id.upper(), 24))}</div></div>"
         "</header>"
         '<section class="compare">'
-        f'<div class="panel"><div class="ptitle"><span>BEFORE / 变更前</span><span>01</span></div>'
-        f"{before_rows}</div>"
+        f'<div class="panel"><div class="ptitle"><span>变更前</span><span>旧</span></div>{before_rows}</div>'
         f'<div class="mid"><span class="ring">{_icon(icon)}</span></div>'
-        f'<div class="panel after"><div class="ptitle"><span>AFTER / 变更后</span><span>02</span></div>'
-        f"{after_rows}</div>"
+        f'<div class="panel after"><div class="ptitle"><span>变更后</span><span>新</span></div>{after_rows}</div>'
         "</section>"
+        f"{_wave_motif()}"
         '<footer class="foot">'
-        "<span>ENV CREDENTIALS · SNAPSHOT DIFF · ACK TRACKED</span>"
-        "<span>APPROVED FIELDS ONLY</span>"
+        "<span>快照差异已跟踪</span><span>仅显示已批准字段</span>"
         "</footer></article>"
     )
     return _document(_CARD_CSS, body)
+
+
+def build_dashboard_html(
+    sources: list[dict[str, Any]], *, generated_at: int | None = None
+) -> str:
+    """Build a redacted multi-source monitor overview for the legacy report path."""
+    rows: list[str] = []
+    for index, source in enumerate(sources[:_MAX_BOARD_ROWS], start=1):
+        if not isinstance(source, dict):
+            continue
+        cleaned = redact(source)
+        if not isinstance(cleaned, dict):
+            continue
+        name = _safe_scalar(cleaned, "display_name", "id") or "未命名站点"
+        source_id = _safe_scalar(cleaned, "id")
+        ready = cleaned.get("ready") is True
+        subscriptions = cleaned.get("subscriptions")
+        rates = cleaned.get("rates")
+        subscription_count = (
+            len(subscriptions) if isinstance(subscriptions, list) else 0
+        )
+        rate_count = len(rates) if isinstance(rates, list) else 0
+        error = _safe_error_text(cleaned.get("error"))
+        state = "可用" if ready and not error else "需检查"
+        tone = "good" if ready and not error else "bad"
+        details = _detail_html(
+            [
+                ("订阅 ", str(subscription_count)),
+                ("分组 ", str(rate_count)),
+                ("编号 ", source_id),
+                ("状态 ", state),
+            ]
+        )
+        error_html = (
+            f'<div class="details"><span><b>提示 </b>{_e(_clip(error, 80))}</span></div>'
+            if error
+            else ""
+        )
+        rows.append(
+            '<div class="row">'
+            f'<span class="idx">{index:02d}</span>'
+            f'<div class="who"><div class="name"><b>{_e(_clip(name, 44))}</b>'
+            f'<em class="chip t-{tone}">{_e(state)}</em></div>{details}{error_html}</div>'
+            f'<span class="val t-{tone}">{subscription_count}<i>订阅</i></span>'
+            "</div>"
+        )
+    rows_html = "".join(rows) or _empty_state("NO SOURCES", "尚未配置可用站点")
+    body = (
+        '<article id="sub2api-dashboard">'
+        '<header class="brand">'
+        f'<span>{_icon("activity")} SIRIUS PULSE / SUB2API</span>'
+        f'<span>{_icon("clock")} {_e(_timestamp(generated_at))}</span>'
+        "</header>"
+        f"{_wave_motif()}"
+        '<header class="head"><div><div class="kicker">'
+        f'{_icon("server")} MONITOR / 站点概览</div><h1>监控总览</h1></div>'
+        f'<div><div class="count">{len(rows)}<small>站</small></div>'
+        '<div class="count-label">已配置站点</div></div></header>'
+        f'<section class="rows">{rows_html}</section>{_wave_motif()}'
+        '<footer class="foot"><span>轮询数据已脱敏</span><span>最近一次轮询存在错误时标记需检查</span></footer>'
+        "</article>"
+    )
+    return _document(_BOARD_CSS, body)
 
 
 async def render_rates_card(
@@ -1103,9 +1242,7 @@ def _rate_tone(value: float | None) -> str:
     return "bad"
 
 
-def _rate_direction(
-    before: dict[str, Any] | None, after: dict[str, Any] | None
-) -> str:
+def _rate_direction(before: dict[str, Any] | None, after: dict[str, Any] | None) -> str:
     old = _finite_rate(_primary_rate_value(before or {}))
     new = _finite_rate(_primary_rate_value(after or {}))
     if old is None or new is None or old == new:
@@ -1131,7 +1268,11 @@ def _price_html(record: dict[str, Any]) -> str:
             price_text = _clip(raw_price, 12)
         else:
             amount = f"{parsed:g}" if parsed == int(parsed) else f"{parsed:.2f}"
-            price_text = f"{symbol}{amount}" if symbol else f"{_clip(currency, 4)} {amount}".strip()
+            price_text = (
+                f"{symbol}{amount}"
+                if symbol
+                else f"{_clip(currency, 4)} {amount}".strip()
+            )
     else:
         price_text = "—"
     period_text = f"/ {_clip(period, 10)}" if period else ""
@@ -1171,7 +1312,9 @@ def _bounded_nonnegative_int(value: Any) -> int:
 
 
 def _document(css: str, body: str) -> str:
-    csp = "default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; font-src 'none'"
+    csp = (
+        "default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; font-src 'none'"
+    )
     return (
         '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
         f'<meta http-equiv="Content-Security-Policy" content="{csp}">'

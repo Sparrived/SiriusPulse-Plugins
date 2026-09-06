@@ -1497,8 +1497,11 @@ class Sub2APIMonitorPlugin(PluginBase):
             getattr(getattr(self.ctx, "message", None), "group_id", "") or ""
         )
         adapter = getattr(self.ctx, "adapter", None)
-        if image_path and group_id and adapter is not None and hasattr(
-            adapter, "send_group_msg"
+        if (
+            image_path
+            and group_id
+            and adapter is not None
+            and hasattr(adapter, "send_group_msg")
         ):
             try:
                 image_ref = to_image_reference(image_path)
@@ -1509,9 +1512,7 @@ class Sub2APIMonitorPlugin(PluginBase):
                 # 图片已直接发送；静默返回避免框架再发一条提示文字
                 return PluginResponse.ok(render_mode="silent")
             except Exception as exc:  # noqa: BLE001
-                self.logger.warning(
-                    "Sub2API 可视化直发失败，回退文本：%s", self._safe_error(exc)
-                )
+                self.logger.warning("Sub2API 可视化直发失败，回退文本：%s", self._safe_error(exc))
         if not records:
             return PluginResponse.ok(text=f"{fallback_title}：暂无数据")
         return PluginResponse.ok(
@@ -2224,49 +2225,79 @@ def _primary_rate_value(record: dict[str, Any] | None) -> Any:
 
 
 def _format_rate_line(record: dict[str, Any]) -> str:
-    """格式化单条倍率记录为人类易读的一行。"""
+    """Format one group-rate record using the same useful fields as its card."""
     name = (
         record.get("name")
         or record.get("group_name")
+        or record.get("groupName")
         or record.get("group")
+        or record.get("group_id")
+        or record.get("groupId")
         or record.get("slug")
         or f"分组 {record.get('id', '?')}"
     )
     rate = _primary_rate_value(record)
-    platform = record.get("platform")
-    status = record.get("status")
-    extras = []
-    if platform:
-        extras.append(str(platform))
-    if status and str(status) != "active":
-        extras.append(str(status))
-    extra_text = f"（{' · '.join(extras)}）" if extras else ""
+    extras: list[str] = []
+    for label, keys in (
+        ("平台", ("platform",)),
+        ("输入", ("input_ratio", "inputRatio")),
+        ("输出", ("output_ratio", "outputRatio", "completion_ratio", "completionRatio")),
+        ("模型", ("model_ratio", "modelRatio")),
+    ):
+        value = next(
+            (record.get(key) for key in keys if record.get(key) not in (None, "")), None
+        )
+        if value not in (None, ""):
+            extras.append(f"{label}: {value}")
+    peak_start = record.get("peak_start") or record.get("peakStart")
+    peak_end = record.get("peak_end") or record.get("peakEnd")
+    if peak_start and peak_end:
+        extras.append(f"峰值: {peak_start} 至 {peak_end}")
     try:
         rate_text = f"{float(rate):g}x"
     except (TypeError, ValueError):
         rate_text = str(rate)
+    extra_text = f"（{'，'.join(extras)}）" if extras else ""
     return f"· {name}：{rate_text}{extra_text}"
 
 
 def _format_subscription_line(record: dict[str, Any]) -> str:
-    """格式化单条订阅记录为人类易读的一行。"""
+    """Format one subscription record with query-card-equivalent information."""
     name = (
         record.get("name")
         or record.get("plan_name")
         or record.get("product_name")
+        or record.get("productName")
         or record.get("slug")
         or f"订阅 {record.get('id', '?')}"
     )
-    extras = []
-    for key in ("plan", "plan_id", "status", "expires_at", "expire_at", "quota"):
-        value = record.get(key)
+    extras: list[str] = []
+    values = (
+        ("编号", ("id", "subscription_id", "subscriptionId")),
+        ("分组", ("group_name", "groupName", "group_id", "groupId")),
+        ("套餐", ("plan", "plan_name", "plan_id", "planId")),
+        ("价格", ("price",)),
+        ("周期", ("period", "billing_cycle", "billingCycle", "duration")),
+        ("额度", ("quota", "limit", "capacity")),
+        ("库存", ("stock", "remaining", "available")),
+        ("到期", ("expires_at", "expire_at", "expired_at")),
+        ("状态", ("status",)),
+    )
+    for label, keys in values:
+        value = next(
+            (record.get(key) for key in keys if record.get(key) not in (None, "")), None
+        )
         if value not in (None, ""):
-            extras.append(f"{key}: {value}")
+            extras.append(f"{label}: {value}")
+    if record.get("enabled") is False:
+        extras.append("状态: 已停用")
     extra_text = f"（{'，'.join(extras)}）" if extras else ""
     return f"· {name}{extra_text}"
 
 
-def _format_records(title: str, records: list[dict[str, Any]], *, kind: str = "") -> str:
+def _format_records(
+    title: str, records: list[dict[str, Any]], *, kind: str = ""
+) -> str:
     """把记录列表格式化为人类易读文本（不再输出原始 JSON）。"""
     if not records:
         return f"{title}：暂无数据"
