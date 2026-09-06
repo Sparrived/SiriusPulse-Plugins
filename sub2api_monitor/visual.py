@@ -436,22 +436,15 @@ _BOARD_CSS = (
 _CARD_CSS = (
     _BASE_CSS
     + """
-.event {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  padding: 6px 8px;
-  border: 2px solid var(--indigo);
-  background: var(--gold);
+.meta {
+  margin-top: 8px;
+  overflow: hidden;
   color: var(--indigo);
-  font: 800 9px/1 var(--mono);
-  letter-spacing: .12em;
+  font: 800 9px/1.5 var(--mono);
+  letter-spacing: .08em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.event svg.ic { width: 11px; height: 11px; }
-.event.t-good { background: var(--wave); color: var(--paper); }
-.event.t-warn { background: var(--gold); color: var(--indigo); }
-.event.t-bad { background: var(--vermilion); color: var(--paper); }
-.meta { margin-top: 9px; color: var(--indigo); font: 800 9px/1.5 var(--mono); letter-spacing: .08em; }
 .compare {
   position: relative;
   display: grid;
@@ -462,10 +455,10 @@ _CARD_CSS = (
 .panel { min-width: 0; padding: 12px; border: 3px solid var(--indigo); background: var(--paper); }
 .panel.after { background: var(--gold); }
 .ptitle { display: flex; justify-content: space-between; margin-bottom: 6px; color: var(--vermilion); font: 800 8.5px/1 var(--mono); letter-spacing: .12em; }
-.prow { display: grid; grid-template-columns: 76px 1fr; gap: 8px; align-items: baseline; padding: 7px 0; border-top: 2px solid var(--indigo); font-size: 12px; line-height: 1.35; }
+.prow { display: grid; grid-template-columns: minmax(0, 76px) minmax(0, 1fr); gap: 8px; align-items: baseline; padding: 7px 0; border-top: 2px solid var(--indigo); font-size: 12px; line-height: 1.35; }
 .prow:first-of-type { border-top: 0; }
 .pkey { overflow: hidden; color: var(--indigo); font: 800 9px/1.3 var(--mono); letter-spacing: .04em; text-overflow: ellipsis; white-space: nowrap; }
-.pval { overflow-wrap: anywhere; color: var(--indigo); font-variant-numeric: tabular-nums; }
+.pval { min-width: 0; overflow: hidden; color: var(--indigo); font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
 .pval.cut { color: var(--vermilion); text-decoration: line-through; }
 .pval.hot { color: var(--vermilion); font-weight: 800; }
 .pval.none::before { content: "无"; color: var(--indigo); }
@@ -713,7 +706,11 @@ def build_change_card_html(
     occurred_at: int | None = None,
 ) -> str:
     """Build a Ukiyo-e before/after change card from approved fields only."""
-    code, title, tone, icon = _EVENT_LABELS.get(event_type, _FALLBACK_EVENT)
+    _code, title, _tone, icon = _EVENT_LABELS.get(event_type, _FALLBACK_EVENT)
+    category = "RATE" if event_type.startswith("rate_") else "SUBSCRIPTION"
+    if event_type not in _EVENT_LABELS:
+        category = "MONITOR"
+    header_label = f"{category} CHANGE / {title}"
     if event_type == "rate_changed":
         direction = _rate_direction(before, after)
         if direction == "up":
@@ -728,13 +725,12 @@ def build_change_card_html(
     body = (
         '<article id="sub2api-card">'
         '<header class="brand">'
-        f'<span>{_icon("activity")} SIRIUS PULSE / SUB2API</span>'
-        f'<span>{_icon("clock")} {_e(_timestamp(occurred_at))}</span>'
+        f"<span>{_e(header_label)}</span>"
+        f"<span>{_e(_timestamp(occurred_at))}</span>"
         "</header>"
         f"{_wave_motif()}"
         '<header class="head">'
-        f'<div><span class="event t-{tone}">{_icon(icon)} {_e(code)} / {_e(title)}</span>'
-        f"<h1>{_e(subject)}</h1>"
+        f"<div><h1>{_e(subject)}</h1>"
         f'<div class="meta">站点 / {_e(_clip(display_name, 48))}'
         f" · {_e(_clip(source_id.upper(), 24))}</div></div>"
         "</header>"
