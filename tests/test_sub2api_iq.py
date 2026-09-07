@@ -65,6 +65,35 @@ def test_iq_projection_fuzzy_matches_and_exposes_only_requested_fields() -> None
     assert "must-not-render" not in str(records)
 
 
+def test_iq_projection_keeps_complete_gpt_model_groups() -> None:
+    models = (
+        "gpt-6-astra",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+    )
+    efforts = ("low", "medium", "high", "xhigh", "max", "ultra")
+    payload = {
+        "points": [
+            {"model": model, "effort": effort, "iq": 100 - index}
+            for index, (model, effort) in enumerate(
+                ((model, effort) for model in models for effort in efforts)
+            )
+        ]
+    }
+
+    records = _project_iq_records(payload, "gpt")
+    grouped: dict[str, list[dict[str, object]]] = {}
+    for record in records:
+        grouped.setdefault(str(record["model"]), []).append(record)
+
+    assert set(grouped) == set(models)
+    assert {model: len(rows) for model, rows in grouped.items()} == {
+        model: len(efforts) for model in models
+    }
+
+
 def test_iq_card_and_text_fallback_show_requested_fields_only() -> None:
     records = _project_iq_records(_payload(), "astra")
     html_text = build_iq_html(

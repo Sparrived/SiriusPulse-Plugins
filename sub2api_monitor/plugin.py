@@ -55,7 +55,7 @@ _IQ_API_URL = (
 )
 _MAX_IQ_RESPONSE_BYTES = 4 * 1024 * 1024
 _MAX_IQ_RECORDS = 2_000
-_MAX_IQ_RESULTS = 16
+_MAX_IQ_MODELS = 8
 _IQ_TIMEOUT_SECONDS = 15.0
 
 
@@ -76,7 +76,7 @@ def _finite_iq_value(value: Any) -> float | None:
 
 
 def _project_iq_records(payload: Any, query: str) -> list[dict[str, Any]]:
-    """Keep only public IQ fields and return bounded fuzzy-search results."""
+    """Keep only public IQ fields and return complete bounded model groups."""
     points = payload.get("points") if isinstance(payload, dict) else None
     if not isinstance(points, list):
         raise Sub2APIError("IQ 接口响应缺少 points 列表")
@@ -120,6 +120,7 @@ def _project_iq_records(payload: Any, query: str) -> list[dict[str, Any]]:
     for item in records:
         groups.setdefault(item[2]["model"], []).append(item)
     selected: list[dict[str, Any]] = []
+    selected_models: list[str] = []
     for _model, model_records in sorted(
         groups.items(),
         key=lambda item: (
@@ -128,9 +129,10 @@ def _project_iq_records(payload: Any, query: str) -> list[dict[str, Any]]:
             item[0].casefold(),
         ),
     ):
-        if selected and len(selected) + len(model_records) > _MAX_IQ_RESULTS:
-            continue
+        if len(selected_models) >= _MAX_IQ_MODELS:
+            break
         selected.extend(record for _match, _iq, record in model_records)
+        selected_models.append(_model)
     return selected
 
 
@@ -153,7 +155,7 @@ class Sub2APIMonitorPlugin(PluginBase):
     _plugin_name = "sub2api_monitor"
     _plugin_display_name = "Sub2API 多站监控"
     _plugin_description = "监控 Sub2API 订阅、分组倍率及公开模型效率 IQ，并生成可视化卡片。"
-    _plugin_version = "0.4.0"
+    _plugin_version = "0.4.1"
     _plugin_author = "Sirius Pulse"
     _plugin_min_framework_version = "1.3.0"
     _plugin_dependencies = ["httpx>=0.24.0", "playwright>=1.57.0"]
