@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import hashlib
 import json
 import math
@@ -12,6 +13,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+import httpx
+
 from sirius_pulse.plugins.api import (
     BackgroundTaskSpec,
     PluginBase,
@@ -19,6 +22,7 @@ from sirius_pulse.plugins.api import (
     command,
 )
 from sirius_pulse.plugins.models import CommandAST
+from sirius_pulse.tools.builtin._internal._markdown_image import to_image_reference
 
 from .client import Sub2APIClient, Sub2APIError
 from .data import (
@@ -39,11 +43,95 @@ from .sources import (
 from .visual import (
     prune_artifacts,
     render_change_card,
+    render_iq_card,
     render_rates_card,
     render_subscriptions_card,
     validated_artifact_image,
 )
-from sirius_pulse.tools.builtin._internal._markdown_image import to_image_reference
+
+_IQ_API_URL = (
+    "https://api.codexradar.com/api/v1/intelligence-efficiency"
+    "?v=20260827-pompeii-trends-v1&benchmark=deep-swe"
+)
+_MAX_IQ_RESPONSE_BYTES = 4 * 1024 * 1024
+_MAX_IQ_RECORDS = 2_000
+_MAX_IQ_RESULTS = 16
+_IQ_TIMEOUT_SECONDS = 15.0
+
+
+def _iq_search_key(value: Any) -> str:
+    return "".join(
+        character for character in str(value or "").casefold() if character.isalnum()
+    )
+
+
+def _finite_iq_value(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _project_iq_records(payload: Any, query: str) -> list[dict[str, Any]]:
+    """Keep only public IQ fields and return bounded fuzzy-search results."""
+    points = payload.get("points") if isinstance(payload, dict) else None
+    if not isinstance(points, list):
+        raise Sub2APIError("IQ 接口响应缺少 points 列表")
+    if len(points) > _MAX_IQ_RECORDS:
+        raise Sub2APIError(f"IQ 接口记录超过安全上限 {_MAX_IQ_RECORDS}")
+
+    query_text = str(query or "").strip()
+    query_key = _iq_search_key(query_text)
+    records: list[tuple[int, float, dict[str, Any]]] = []
+    for raw in points:
+        if not isinstance(raw, dict):
+            continue
+        model = str(raw.get("model") or "").strip()
+        model_key = _iq_search_key(model)
+        if not model or not model_key:
+            continue
+        direct_match = not query_key or query_key in model_key
+        similarity = (
+            difflib.SequenceMatcher(None, query_key, model_key).ratio()
+            if query_key
+            else 1.0
+        )
+        if query_key and not direct_match and similarity < 0.68:
+            continue
+        iq = _finite_iq_value(raw.get("iq"))
+        records.append(
+            (
+                0 if direct_match else 1,
+                -(iq if iq is not None else -1.0),
+                {
+                    "model": model,
+                    "effort": str(raw.get("effort") or "").strip(),
+                    "iq": iq,
+                    "average_price_usd": _finite_iq_value(raw.get("average_price_usd")),
+                    "average_minutes": _finite_iq_value(raw.get("average_minutes")),
+                    "cache_hit_rate": _finite_iq_value(raw.get("cache_hit_rate")),
+                },
+            )
+        )
+    groups: dict[str, list[tuple[int, float, dict[str, Any]]]] = {}
+    for item in records:
+        groups.setdefault(item[2]["model"], []).append(item)
+    selected: list[dict[str, Any]] = []
+    for _model, model_records in sorted(
+        groups.items(),
+        key=lambda item: (
+            min(row[0] for row in item[1]),
+            min(row[1] for row in item[1]),
+            item[0].casefold(),
+        ),
+    ):
+        if selected and len(selected) + len(model_records) > _MAX_IQ_RESULTS:
+            continue
+        selected.extend(record for _match, _iq, record in model_records)
+    return selected
 
 
 class Sub2APIMonitorPlugin(PluginBase):
@@ -64,8 +152,8 @@ class Sub2APIMonitorPlugin(PluginBase):
 
     _plugin_name = "sub2api_monitor"
     _plugin_display_name = "Sub2API 多站监控"
-    _plugin_description = "监控多个 Sub2API 站点的订阅与分组倍率，并生成可视化变化图。"
-    _plugin_version = "0.3.0"
+    _plugin_description = "监控 Sub2API 订阅、分组倍率及公开模型效率 IQ，并生成可视化卡片。"
+    _plugin_version = "0.4.0"
     _plugin_author = "Sirius Pulse"
     _plugin_min_framework_version = "1.3.0"
     _plugin_dependencies = ["httpx>=0.24.0", "playwright>=1.57.0"]
@@ -610,13 +698,14 @@ class Sub2APIMonitorPlugin(PluginBase):
         prefix="/",
         patterns=["sub2api", "sub2api_monitor"],
         render_mode="direct",
-        description="查看、轮询或可视化输出 Sub2API 多站点监控数据。",
+        description="查询 Sub2API 监控数据或 CodexRadar 模型效率 IQ 卡片。",
         hidden_from_intent=True,
         examples=[
             "/sub2api status",
             "/sub2api poll all",
             "/sub2api subscriptions alpha",
             "/sub2api rates alpha",
+            "/sub2api iq deepseek",
         ],
     )
     def sub2api_command(self) -> PluginResponse:
@@ -689,6 +778,9 @@ class Sub2APIMonitorPlugin(PluginBase):
                     return [PluginResponse.fail("当前人格未被配置为 Sub2API 轮询执行者")]
                 result = await self.poll_once(notify=True, selector=selector)
                 return [PluginResponse.ok(text=self._poll_text(result))]
+            if action in {"iq", "intelligence", "智能"}:
+                records = await self._fetch_iq_records(selector)
+                return [await self._send_iq_image(records, selector)]
             if action in {"subscriptions", "plans", "订阅"}:
                 source, data = await self._fetch_one("subscriptions", selector)
                 return [
@@ -720,7 +812,7 @@ class Sub2APIMonitorPlugin(PluginBase):
             return [
                 PluginResponse.fail(
                     "用法：/sub2api status|poll [id|all]|subscriptions <id>|"
-                    "rates <id>|reset [id|all]"
+                    "rates <id>|iq [模型关键词]|reset [id|all]"
                 )
             ]
         except Exception as exc:  # noqa: BLE001
@@ -1457,6 +1549,67 @@ class Sub2APIMonitorPlugin(PluginBase):
             if name == "subscriptions":
                 return source, await client.fetch_subscriptions()
             return source, await client.fetch_group_rates()
+
+    async def _fetch_iq_records(self, query: str) -> list[dict[str, Any]]:
+        """Fetch the public CodexRadar board without reusing private site credentials."""
+        try:
+            timeout = httpx.Timeout(_IQ_TIMEOUT_SECONDS)
+            async with httpx.AsyncClient(
+                timeout=timeout, follow_redirects=False
+            ) as client:
+                response = await client.get(
+                    _IQ_API_URL,
+                    headers={
+                        "Accept": "application/json",
+                        "User-Agent": "SiriusPulse-Sub2API/0.4",
+                    },
+                )
+                response.raise_for_status()
+                body = response.content
+        except httpx.HTTPError as exc:
+            raise Sub2APIError(f"IQ 接口请求失败：{self._safe_error(exc)}") from exc
+        if len(body) > _MAX_IQ_RESPONSE_BYTES:
+            raise Sub2APIError("IQ 接口响应超过安全上限")
+        try:
+            payload = json.loads(body)
+        except (TypeError, ValueError, UnicodeDecodeError) as exc:
+            raise Sub2APIError("IQ 接口返回了无效 JSON") from exc
+        return _project_iq_records(payload, query)
+
+    async def _send_iq_image(
+        self, records: list[dict[str, Any]], query: str
+    ) -> PluginResponse:
+        """Render the public IQ result board and fall back to a compact text list."""
+        artifact_dir = self._artifact_dir()
+        rendered = await render_iq_card(
+            records,
+            query=query,
+            artifact_dir=artifact_dir,
+            generated_at=int(time.time()),
+        )
+        image_path = validated_artifact_image(artifact_dir, rendered)
+        group_id = str(
+            getattr(getattr(self.ctx, "message", None), "group_id", "") or ""
+        )
+        adapter = getattr(self.ctx, "adapter", None)
+        if (
+            image_path
+            and group_id
+            and adapter is not None
+            and hasattr(adapter, "send_group_msg")
+        ):
+            try:
+                image_ref = to_image_reference(image_path)
+                await adapter.send_group_msg(
+                    group_id, [{"type": "image", "data": {"file": image_ref}}]
+                )
+                return PluginResponse.ok(render_mode="silent")
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning("IQ 卡片直发失败，回退文本：%s", self._safe_error(exc))
+        if not records:
+            query_text = f"“{query}”" if query else "当前条件"
+            return PluginResponse.ok(text=f"IQ 查询：{query_text} 未找到匹配模型")
+        return PluginResponse.ok(text=_format_iq_records(records, query=query))
 
     async def _send_board_image(
         self,
@@ -2293,6 +2446,33 @@ def _format_subscription_line(record: dict[str, Any]) -> str:
         extras.append("状态: 已停用")
     extra_text = f"（{'，'.join(extras)}）" if extras else ""
     return f"· {name}{extra_text}"
+
+
+def _format_iq_records(records: list[dict[str, Any]], *, query: str) -> str:
+    """Format public IQ results when the optional image path is unavailable."""
+    title = f"IQ 查询“{query}”" if query else "模型 IQ 效率榜"
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        model = str(record.get("model") or "未知模型")
+        groups.setdefault(model, []).append(record)
+    lines = []
+    for model, model_records in groups.items():
+        lines.append(f"· {model}")
+        for record in model_records:
+            effort = str(record.get("effort") or "—")
+            iq = _finite_iq_value(record.get("iq"))
+            price = _finite_iq_value(record.get("average_price_usd"))
+            minutes = _finite_iq_value(record.get("average_minutes"))
+            cache = _finite_iq_value(record.get("cache_hit_rate"))
+            iq_text = f"{iq:g}" if iq is not None else "—"
+            price_text = f"${price:.3f}" if price is not None else "—"
+            minutes_text = f"{minutes:g} 分" if minutes is not None else "—"
+            cache_text = f"{cache * 100:.1f}%" if cache is not None else "—"
+            lines.append(
+                f"  - {effort}（IQ: {iq_text}，均价: {price_text}，"
+                f"耗时: {minutes_text}，缓存: {cache_text}）"
+            )
+    return f"{title}（{len(groups)} 个模型 / {len(records)} 档）\n" + "\n".join(lines)
 
 
 def _format_records(

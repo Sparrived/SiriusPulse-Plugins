@@ -125,10 +125,11 @@ uv run python main.py run
 | `/sub2api poll [id\|display_name\|all]` | 立即轮询；省略选择器时处理全部启用站点 |
 | `/sub2api subscriptions <id\|display_name>` | 查询一个站点的当前可售订阅；只有一个启用站点时可省略选择器 |
 | `/sub2api rates <id\|display_name>` | 查询一个站点的当前分组倍率；只有一个启用站点时可省略选择器 |
+| `/sub2api iq [模型关键词]` | 查询公开 CodexRadar `deep-swe` 模型效率榜；按 `model` 模糊搜索，卡片展示 effort、IQ、均价、平均耗时和缓存命中率 |
 | `/sub2api report [id\|display_name\|all]` | 在已授权通知群生成并发送 Playwright 多站运行图 |
 | `/sub2api reset [id\|display_name\|all]` | 删除所选站点状态（兼容模式删除旧版顶层状态）；下一次轮询静默初始化 |
 
-所有上述状态读取、联网查询、轮询、图表和重置命令都只能由 `run_on_persona` 指定的人格执行，并仍要求开发者权限；`subscriptions` / `rates` 还要求有效凭据和唯一启用站点。`status` 不带选择器或显式使用 `all` 时列出全部已配置站点（含停用项）；`poll`、`report` 不带选择器或使用 `all` 时只处理启用站点；`reset all` 会清理全部已配置站点（含停用项）的状态。
+`iq` 使用公开 CodexRadar 数据，不读取站点配置、凭据或快照，因此不要求 `run_on_persona`；仍要求开发者权限。其余上述状态读取、联网查询、轮询、图表和重置命令都只能由 `run_on_persona` 指定的人格执行，并仍要求开发者权限；`subscriptions` / `rates` 还要求有效凭据和唯一启用站点。`status` 不带选择器或显式使用 `all` 时列出全部已配置站点（含停用项）；`poll`、`report` 不带选择器或使用 `all` 时只处理启用站点；`reset all` 会清理全部已配置站点（含停用项）的状态。
 若多个站点使用相同 `display_name`，请改用 ID；包含空格的唯一显示名称也可直接作为完整选择器使用。
 
 ## Playwright 与 Chromium

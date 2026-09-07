@@ -433,6 +433,39 @@ _BOARD_CSS = (
 """
 )
 
+_IQ_CSS = (
+    _BOARD_CSS
+    + """
+.iq-groups { padding: 0 18px 14px; }
+.iq-model { padding: 14px 0 2px; border-top: 3px solid var(--indigo); }
+.iq-model:first-child { border-top: 0; }
+.iq-model-head {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding-bottom: 8px;
+}
+.iq-model-head b { overflow: hidden; color: var(--indigo); font: 800 17px/1.2 var(--sans); text-overflow: ellipsis; white-space: nowrap; }
+.iq-model-count { color: var(--vermilion); font: 800 9px/1 var(--mono); letter-spacing: .08em; white-space: nowrap; }
+.iq-efforts { border: 2px solid var(--indigo); background: var(--paper); }
+.iq-effort {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 10px;
+  border-top: 2px solid var(--indigo);
+}
+.iq-effort:first-child { border-top: 0; }
+.iq-effort-info { min-width: 0; }
+.iq-effort-label { display: block; overflow: hidden; color: var(--vermilion); font: 800 9px/1.2 var(--mono); letter-spacing: .1em; text-overflow: ellipsis; white-space: nowrap; }
+.iq-effort .details { margin-top: 5px; }
+.iq-effort .val { font-size: 19px; }
+"""
+)
+
+
 _CARD_CSS = (
     _BASE_CSS
     + """
@@ -561,6 +594,111 @@ def _safe_error_text(value: Any) -> str:
         "[已隐藏]",
         text,
     )
+
+
+_IQ_EFFORT_ORDER = {"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4, "ultra": 5}
+
+
+def _iq_number(value: Any, *, decimals: int = 2, suffix: str = "") -> str:
+    parsed = _finite_rate(value)
+    if parsed is None:
+        return "—"
+    rendered = f"{parsed:.{decimals}f}".rstrip("0").rstrip(".")
+    return f"{rendered}{suffix}"
+
+
+def _iq_details(record: dict[str, Any]) -> str:
+    cache = _finite_rate(record.get("cache_hit_rate"))
+    cache_text = f"{cache * 100:.1f}%" if cache is not None else "—"
+    price = _iq_number(record.get("average_price_usd"), decimals=3)
+    return _detail_html(
+        [
+            ("均价 ", f"USD {price}"),
+            ("耗时 ", _iq_number(record.get("average_minutes"), suffix=" 分")),
+            ("缓存 ", cache_text),
+        ]
+    )
+
+
+def _iq_record_sort_key(record: dict[str, Any]) -> tuple[int, str]:
+    effort = _safe_scalar(record, "effort").casefold()
+    return (_IQ_EFFORT_ORDER.get(effort, len(_IQ_EFFORT_ORDER)), effort)
+
+
+def build_iq_html(
+    *,
+    records: list[dict[str, Any]],
+    query: str = "",
+    generated_at: int | None = None,
+) -> str:
+    """Build a safe Ukiyo-e board grouped by model and its effort levels."""
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        model = _safe_scalar(record, "model")
+        if model:
+            groups.setdefault(model, []).append(record)
+    ordered_groups = sorted(
+        groups.items(),
+        key=lambda item: (
+            -max(
+                value if value is not None else float("-inf")
+                for value in (_finite_rate(record.get("iq")) for record in item[1])
+            ),
+            item[0].casefold(),
+        ),
+    )
+    shown_records = sum(len(model_records) for _model, model_records in ordered_groups)
+
+    group_html: list[str] = []
+    for index, (model, model_records) in enumerate(ordered_groups, start=1):
+        efforts: list[str] = []
+        for record in sorted(model_records, key=_iq_record_sort_key):
+            effort = _safe_scalar(record, "effort") or "—"
+            iq = _iq_number(record.get("iq"))
+            tone = _rate_tone(_finite_rate(record.get("iq")))
+            efforts.append(
+                '<div class="iq-effort">'
+                '<div class="iq-effort-info">'
+                f'<span class="iq-effort-label">EFFORT / {_e(effort)}</span>'
+                f"{_iq_details(record)}</div>"
+                f'<span class="val t-{tone}">{_e(iq)}<i>IQ</i></span>'
+                "</div>"
+            )
+        group_html.append(
+            '<section class="iq-model">'
+            '<header class="iq-model-head">'
+            f'<span class="idx">{index:02d}</span>'
+            f"<b>{_e(_clip(model, 52))}</b>"
+            f'<span class="iq-model-count">{len(model_records)} 档</span>'
+            "</header>"
+            f'<div class="iq-efforts">{"".join(efforts)}</div>'
+            "</section>"
+        )
+    groups_html = "".join(group_html) or _empty_state("NO IQ MATCHES", "未找到匹配的模型效率记录")
+    heading = _clip(query, 40) if query else "模型效率榜"
+    label = "模糊搜索结果" if query else "按 IQ 排序"
+    body = (
+        '<article id="sub2api-iq">'
+        '<header class="brand">'
+        "<span>INTELLIGENCE IQ / 智能效率</span>"
+        f"<span>{_e(_timestamp(generated_at))}</span>"
+        "</header>"
+        f"{_wave_motif()}"
+        '<header class="head">'
+        f"<div><h1>{_e(heading)}</h1></div>"
+        f'<div><div class="count">{len(ordered_groups)}<small>模型</small></div>'
+        f'<div class="count-label">{shown_records} 档 / {_e(label)}</div></div>'
+        "</header>"
+        f'<section class="iq-groups">{groups_html}</section>'
+        f"{_wave_motif()}"
+        '<footer class="foot">'
+        "<span>基准 / DEEP-SWE</span>"
+        "<span>IQ、力度、均价、耗时与缓存命中率</span>"
+        "</footer></article>"
+    )
+    return _document(_IQ_CSS, body)
 
 
 def build_rates_html(
@@ -851,6 +989,22 @@ async def render_subscriptions_card(
         selector="#sub2api-board",
         artifact_dir=artifact_dir,
         filename_prefix=f"sub2api_subs_{_safe_slug(source_id)}",
+    )
+
+
+async def render_iq_card(
+    records: list[dict[str, Any]],
+    *,
+    query: str,
+    artifact_dir: Path,
+    generated_at: int | None = None,
+) -> str | None:
+    """Render the public intelligence-efficiency query board."""
+    return await _render_html(
+        build_iq_html(records=records, query=query, generated_at=generated_at),
+        selector="#sub2api-iq",
+        artifact_dir=artifact_dir,
+        filename_prefix="sub2api_iq",
     )
 
 
