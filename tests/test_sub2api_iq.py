@@ -106,6 +106,17 @@ def test_iq_card_and_text_fallback_show_requested_fields_only() -> None:
     assert html_text.count("gpt-6-astra") == 1
     assert html_text.index("EFFORT / low") < html_text.index("EFFORT / high")
     assert "iq-model" in html_text
+    assert "grid-template-columns: repeat(2, minmax(0, 1fr))" in html_text
+    assert "价 " in html_text and "时 " in html_text and "存 " in html_text
+    long_model = "gpt-very-long-model-name-without-truncation"
+    long_query = "query-without-truncation-" * 3
+    uncut_html = build_iq_html(
+        records=[{"model": long_model, "effort": "very-long-effort", "iq": 1}],
+        query=long_query,
+    )
+    assert long_model in uncut_html
+    assert long_query in uncut_html
+    assert "overflow-wrap: anywhere" in uncut_html
     full_html = build_iq_html(
         records=_project_iq_records(_payload(), ""), generated_at=1_700_000_000
     )

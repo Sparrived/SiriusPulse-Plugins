@@ -446,22 +446,44 @@ _IQ_CSS = (
   gap: 10px;
   padding-bottom: 8px;
 }
-.iq-model-head b { overflow: hidden; color: var(--indigo); font: 800 17px/1.2 var(--sans); text-overflow: ellipsis; white-space: nowrap; }
+#sub2api-iq h1 {
+  overflow: visible;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  white-space: normal;
+}
+.iq-model-head b { overflow-wrap: anywhere; color: var(--indigo); font: 800 17px/1.2 var(--sans); }
 .iq-model-count { color: var(--vermilion); font: 800 9px/1 var(--mono); letter-spacing: .08em; white-space: nowrap; }
-.iq-efforts { border: 2px solid var(--indigo); background: var(--paper); }
+.iq-efforts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  border: 2px solid var(--indigo);
+  background: var(--paper);
+}
 .iq-effort {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  gap: 12px;
+  gap: 8px;
+  min-width: 0;
   padding: 9px 10px;
   border-top: 2px solid var(--indigo);
+  border-left: 2px solid var(--indigo);
 }
-.iq-effort:first-child { border-top: 0; }
+.iq-effort:nth-child(odd) { border-left: 0; }
+.iq-effort:nth-child(-n + 2) { border-top: 0; }
 .iq-effort-info { min-width: 0; }
-.iq-effort-label { display: block; overflow: hidden; color: var(--vermilion); font: 800 9px/1.2 var(--mono); letter-spacing: .1em; text-overflow: ellipsis; white-space: nowrap; }
-.iq-effort .details { margin-top: 5px; }
-.iq-effort .val { font-size: 19px; }
+.iq-effort-label { display: block; overflow-wrap: anywhere; color: var(--vermilion); font: 800 9px/1.2 var(--mono); letter-spacing: .1em; }
+.iq-effort .details {
+  display: grid;
+  grid-template-columns: repeat(3, max-content);
+  gap: 4px;
+  margin-top: 5px;
+  overflow: visible;
+  font-size: 8px;
+}
+.iq-effort .details span { overflow: visible; text-overflow: clip; }
+.iq-effort .val { font-size: 17px; }
 """
 )
 
@@ -599,6 +621,15 @@ def _safe_error_text(value: Any) -> str:
 _IQ_EFFORT_ORDER = {"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4, "ultra": 5}
 
 
+def _iq_scalar(record: dict[str, Any], key: str) -> str:
+    value = record.get(key)
+    return (
+        str(value).strip()
+        if value not in (None, "") and not isinstance(value, (dict, list, tuple, set))
+        else ""
+    )
+
+
 def _iq_number(value: Any, *, decimals: int = 2, suffix: str = "") -> str:
     parsed = _finite_rate(value)
     if parsed is None:
@@ -613,15 +644,15 @@ def _iq_details(record: dict[str, Any]) -> str:
     price = _iq_number(record.get("average_price_usd"), decimals=3)
     return _detail_html(
         [
-            ("均价 ", f"USD {price}"),
-            ("耗时 ", _iq_number(record.get("average_minutes"), suffix=" 分")),
-            ("缓存 ", cache_text),
+            ("价 ", "$" + price),
+            ("时 ", _iq_number(record.get("average_minutes"), suffix="m")),
+            ("存 ", cache_text),
         ]
     )
 
 
 def _iq_record_sort_key(record: dict[str, Any]) -> tuple[int, str]:
-    effort = _safe_scalar(record, "effort").casefold()
+    effort = _iq_scalar(record, "effort").casefold()
     return (_IQ_EFFORT_ORDER.get(effort, len(_IQ_EFFORT_ORDER)), effort)
 
 
@@ -636,7 +667,7 @@ def build_iq_html(
     for record in records:
         if not isinstance(record, dict):
             continue
-        model = _safe_scalar(record, "model")
+        model = _iq_scalar(record, "model")
         if model:
             groups.setdefault(model, []).append(record)
     ordered_groups = sorted(
@@ -655,7 +686,7 @@ def build_iq_html(
     for index, (model, model_records) in enumerate(ordered_groups, start=1):
         efforts: list[str] = []
         for record in sorted(model_records, key=_iq_record_sort_key):
-            effort = _safe_scalar(record, "effort") or "—"
+            effort = _iq_scalar(record, "effort") or "—"
             iq = _iq_number(record.get("iq"))
             tone = _rate_tone(_finite_rate(record.get("iq")))
             efforts.append(
@@ -670,14 +701,14 @@ def build_iq_html(
             '<section class="iq-model">'
             '<header class="iq-model-head">'
             f'<span class="idx">{index:02d}</span>'
-            f"<b>{_e(_clip(model, 52))}</b>"
+            f"<b>{_e(model)}</b>"
             f'<span class="iq-model-count">{len(model_records)} 档</span>'
             "</header>"
             f'<div class="iq-efforts">{"".join(efforts)}</div>'
             "</section>"
         )
     groups_html = "".join(group_html) or _empty_state("NO IQ MATCHES", "未找到匹配的模型效率记录")
-    heading = _clip(query, 40) if query else "模型效率榜"
+    heading = query if query else "模型效率榜"
     label = "模糊搜索结果" if query else "按 IQ 排序"
     body = (
         '<article id="sub2api-iq">'

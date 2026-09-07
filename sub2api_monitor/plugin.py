@@ -155,7 +155,7 @@ class Sub2APIMonitorPlugin(PluginBase):
     _plugin_name = "sub2api_monitor"
     _plugin_display_name = "Sub2API 多站监控"
     _plugin_description = "监控 Sub2API 订阅、分组倍率及公开模型效率 IQ，并生成可视化卡片。"
-    _plugin_version = "0.4.1"
+    _plugin_version = "0.4.2"
     _plugin_author = "Sirius Pulse"
     _plugin_min_framework_version = "1.3.0"
     _plugin_dependencies = ["httpx>=0.24.0", "playwright>=1.57.0"]
