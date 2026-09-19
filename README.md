@@ -5,7 +5,6 @@ External plugins for [Sirius Pulse](https://github.com/Sparrived/SiriusPulse).
 ## Included plugins
 
 - `github_monitor`: monitors configured GitHub repositories through Poll or Webhook delivery and sends aggregated Issue, Pull Request, Release, Comment, and Push notifications with optional screenshots.
-- `amkr_key_manager`: manages AMKR models and API keys through its local management API.
 - `sub2api_monitor`: monitors Sub2API subscription listing changes and group rate multipliers, then notifies configured chats.
 
 ## Installation
