@@ -125,7 +125,7 @@ uv run python main.py run
 | `/sub2api poll [id\|display_name\|all]` | 立即轮询；省略选择器时处理全部启用站点 |
 | `/sub2api subscriptions <id\|display_name>` | 查询一个站点的当前可售订阅；只有一个启用站点时可省略选择器 |
 | `/sub2api rates <id\|display_name>` | 查询一个站点的当前分组倍率；只有一个启用站点时可省略选择器 |
-| `/sub2api iq [模型关键词]` | 查询公开 CodexRadar `deep-swe` 模型效率榜；按 `model` 模糊搜索，卡片展示 effort、IQ、均价、平均耗时和缓存命中率 |
+| `/sub2api iq [模型关键词]` | 查询公开 CodexRadar 近 7 天模型评分（0–10 分）；按模型 `id`、完整 `label` 或系列 `group` 模糊搜索，以多系列折线图比较各推理档位评分，无评分时断线；图例展示系列峰值与评分总数 |
 | `/sub2api report [id\|display_name\|all]` | 在已授权通知群生成并发送 Playwright 多站运行图 |
 | `/sub2api reset [id\|display_name\|all]` | 删除所选站点状态（兼容模式删除旧版顶层状态）；下一次轮询静默初始化 |
 

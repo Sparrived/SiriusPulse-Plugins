@@ -1,8 +1,7 @@
-"""Safe, local-only Ukiyo-e visualizations for the Sub2API monitor.
+"""Safe, local-only visualizations for the Sub2API monitor.
 
-Reports use opaque washi paper, indigo outlines, vermilion seals, gold fields,
-and hard-edged woodblock shadows. All rendering is local (network blocked,
-JavaScript disabled, CSP enforced).
+Operational reports use Ukiyo-e styling; IQ ratings use a compact cyberpunk
+chart. All rendering is local (network blocked, JavaScript disabled, CSP enforced).
 """
 
 from __future__ import annotations
@@ -433,59 +432,153 @@ _BOARD_CSS = (
 """
 )
 
-_IQ_CSS = (
-    _BOARD_CSS
-    + """
-.iq-groups { padding: 0 18px 14px; }
-.iq-model { padding: 14px 0 2px; border-top: 3px solid var(--indigo); }
-.iq-model:first-child { border-top: 0; }
-.iq-model-head {
+_IQ_CSS = """
+:root {
+  --bg: #080d18;
+  --panel: #101827;
+  --cyan: #4de8d2;
+  --purple: #ac9cff;
+  --text: #e6f0fa;
+  --dim: #91a3ba;
+  --line: #26364b;
+  --sans: "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  --mono: "Cascadia Mono", Consolas, "Microsoft YaHei", monospace;
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+}
+#sub2api-iq {
+  width: 680px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  background: var(--bg);
+}
+.iq-brand {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 24px;
+  border-bottom: 1px solid var(--line);
+  color: var(--dim);
+  font: 11px/1.4 var(--mono);
+}
+.iq-brand span:first-child { color: var(--cyan); font-weight: 700; letter-spacing: .1em; }
+.iq-brand time { white-space: nowrap; }
+.iq-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 20px;
+  padding: 18px 24px 16px;
+  border-left: 3px solid var(--cyan);
+}
+.iq-kicker {
+  margin-bottom: 9px;
+  color: var(--purple);
+  font: 11px/1.3 var(--mono);
+  letter-spacing: .08em;
+}
+#sub2api-iq h1 {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font: 700 30px/1.25 var(--sans);
+}
+.iq-subtitle {
+  margin-top: 7px;
+  color: var(--dim);
+  font: 12px/1.5 var(--sans);
+}
+.iq-best {
+  color: var(--cyan);
+  font: 700 40px/1 var(--mono);
+  text-align: right;
+}
+.iq-best small { color: var(--dim); font-size: 15px; }
+.iq-best-label {
+  margin-top: 7px;
+  color: var(--dim);
+  font: 10px/1.3 var(--mono);
+  text-align: right;
+}
+.iq-summary {
+  display: flex;
+  gap: 24px;
+  margin: 0 24px 14px;
+  padding: 9px 0;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  color: var(--dim);
+  font: 11px/1.4 var(--mono);
+}
+.iq-summary b { margin-right: 4px; color: var(--text); font-size: 14px; }
+.iq-chart-caption {
+  margin: 0 24px 8px;
+  color: var(--dim);
+  font: 10px/1.4 var(--mono);
+}
+.iq-chart { margin: 0 16px; border: 1px solid var(--line); background: var(--panel); }
+.iq-chart svg { display: block; width: 100%; height: auto; }
+.iq-grid { stroke: var(--line); stroke-width: .7; }
+.iq-axis-text { fill: var(--dim); font: 10px var(--mono); }
+.iq-effort-text { fill: var(--text); font: 10px var(--mono); }
+.iq-series-line {
+  fill: none;
+  stroke-width: 1.8;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+.iq-series-point { stroke-width: 1.5; }
+.iq-legend {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 20px;
+  padding: 10px 24px 14px;
+}
+.iq-legend-item {
   display: grid;
   grid-template-columns: 28px minmax(0, 1fr) auto;
   align-items: center;
-  gap: 10px;
-  padding-bottom: 8px;
-}
-#sub2api-iq h1 {
-  overflow: visible;
-  overflow-wrap: anywhere;
-  text-overflow: clip;
-  white-space: normal;
-}
-.iq-model-head b { overflow-wrap: anywhere; color: var(--indigo); font: 800 17px/1.2 var(--sans); }
-.iq-model-count { color: var(--vermilion); font: 800 9px/1 var(--mono); letter-spacing: .08em; white-space: nowrap; }
-.iq-efforts {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  border: 2px solid var(--indigo);
-  background: var(--paper);
-}
-.iq-effort {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
   gap: 8px;
-  min-width: 0;
-  padding: 9px 10px;
-  border-top: 2px solid var(--indigo);
-  border-left: 2px solid var(--indigo);
+  min-height: 33px;
+  border-top: 1px solid var(--line);
 }
-.iq-effort:nth-child(odd) { border-left: 0; }
-.iq-effort:nth-child(-n + 2) { border-top: 0; }
-.iq-effort-info { min-width: 0; }
-.iq-effort-label { display: block; overflow-wrap: anywhere; color: var(--vermilion); font: 800 9px/1.2 var(--mono); letter-spacing: .1em; }
-.iq-effort .details {
-  display: grid;
-  grid-template-columns: repeat(3, max-content);
-  gap: 4px;
-  margin-top: 5px;
-  overflow: visible;
-  font-size: 8px;
+.iq-legend-item:nth-child(-n + 2) { border-top: 0; }
+.iq-legend-mark { width: 28px; height: 12px; overflow: visible; }
+.iq-legend-mark > line { stroke-width: 1.8; }
+.iq-legend-name { overflow-wrap: anywhere; font: 600 12px/1.25 var(--sans); }
+.iq-legend-value {
+  color: var(--dim);
+  font: 10px/1.3 var(--mono);
+  text-align: right;
+  white-space: nowrap;
 }
-.iq-effort .details span { overflow: visible; text-overflow: clip; }
-.iq-effort .val { font-size: 17px; }
+.iq-legend-value b { color: var(--text); font-size: 12px; }
+.iq-empty { padding: 35px 24px; border-top: 1px solid var(--line); text-align: center; }
+.iq-empty b {
+  display: block;
+  margin-bottom: 9px;
+  color: var(--purple);
+  font: 700 13px/1.3 var(--mono);
+}
+.iq-empty small { color: var(--dim); font-size: 12px; }
+.iq-foot {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 15px 24px;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--dim);
+  font: 10px/1.5 var(--mono);
+}
+.iq-foot span:first-child { color: var(--cyan); }
 """
-)
 
 
 _CARD_CSS = (
@@ -618,9 +711,6 @@ def _safe_error_text(value: Any) -> str:
     )
 
 
-_IQ_EFFORT_ORDER = {"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4, "ultra": 5}
-
-
 def _iq_scalar(record: dict[str, Any], key: str) -> str:
     value = record.get(key)
     return (
@@ -630,7 +720,7 @@ def _iq_scalar(record: dict[str, Any], key: str) -> str:
     )
 
 
-def _iq_number(value: Any, *, decimals: int = 2, suffix: str = "") -> str:
+def _iq_number(value: Any, *, decimals: int = 1, suffix: str = "") -> str:
     parsed = _finite_rate(value)
     if parsed is None:
         return "—"
@@ -638,22 +728,25 @@ def _iq_number(value: Any, *, decimals: int = 2, suffix: str = "") -> str:
     return f"{rendered}{suffix}"
 
 
-def _iq_details(record: dict[str, Any]) -> str:
-    cache = _finite_rate(record.get("cache_hit_rate"))
-    cache_text = f"{cache * 100:.1f}%" if cache is not None else "—"
-    price = _iq_number(record.get("average_price_usd"), decimals=3)
-    return _detail_html(
-        [
-            ("价 ", "$" + price),
-            ("时 ", _iq_number(record.get("average_minutes"), suffix="m")),
-            ("存 ", cache_text),
-        ]
+def _iq_marker(index: int, x: float, y: float, color: str, title: str) -> str:
+    """Return a distinct, colorblind-friendly point symbol for one model series."""
+    shapes = (
+        f'<circle cx="{x:g}" cy="{y:g}" r="4"/>',
+        f'<rect x="{x - 4:g}" y="{y - 4:g}" width="8" height="8"/>',
+        f'<path d="M {x:g} {y - 5:g} L {x + 5:g} {y:g} L {x:g} {y + 5:g} L {x - 5:g} {y:g} Z"/>',
+        f'<path d="M {x:g} {y - 5:g} L {x + 5:g} {y + 4:g} L {x - 5:g} {y + 4:g} Z"/>',
+        f'<path d="M {x - 4:g} {y - 4:g} H {x + 4:g} V {y + 4:g} H {x - 4:g} Z '
+        f'M {x - 5:g} {y:g} H {x + 5:g} M {x:g} {y - 5:g} V {y + 5:g}"/>',
+        f'<path d="M {x - 4:g} {y - 4:g} L {x + 4:g} {y + 4:g} '
+        f'M {x + 4:g} {y - 4:g} L {x - 4:g} {y + 4:g}"/>',
+        f'<path d="M {x:g} {y - 5:g} L {x + 5:g} {y:g} L {x:g} {y + 5:g} '
+        f'L {x - 5:g} {y:g} Z M {x:g} {y - 2:g} V {y + 2:g}"/>',
+        f'<path d="M {x - 4:g} {y - 3:g} H {x + 4:g} V {y + 3:g} H {x - 4:g} Z"/>',
     )
-
-
-def _iq_record_sort_key(record: dict[str, Any]) -> tuple[int, str]:
-    effort = _iq_scalar(record, "effort").casefold()
-    return (_IQ_EFFORT_ORDER.get(effort, len(_IQ_EFFORT_ORDER)), effort)
+    return (
+        f'<g class="iq-series-point" fill="{color}" stroke="{color}" '
+        f'stroke-width="1.5">{shapes[index % len(shapes)]}<title>{title}</title></g>'
+    )
 
 
 def build_iq_html(
@@ -662,7 +755,7 @@ def build_iq_html(
     query: str = "",
     generated_at: int | None = None,
 ) -> str:
-    """Build a safe Ukiyo-e board grouped by model and its effort levels."""
+    """Build a compact multi-series line chart for public model ratings."""
     groups: dict[str, list[dict[str, Any]]] = {}
     for record in records:
         if not isinstance(record, dict):
@@ -674,59 +767,156 @@ def build_iq_html(
         groups.items(),
         key=lambda item: (
             -max(
-                value if value is not None else float("-inf")
-                for value in (_finite_rate(record.get("iq")) for record in item[1])
+                (
+                    value
+                    for record in item[1]
+                    if (value := _finite_rate(record.get("average"))) is not None
+                ),
+                default=-1.0,
             ),
             item[0].casefold(),
         ),
     )
     shown_records = sum(len(model_records) for _model, model_records in ordered_groups)
+    ratings = [
+        value
+        for _model, model_records in ordered_groups
+        for record in model_records
+        if (value := _finite_rate(record.get("average"))) is not None
+    ]
+    total_count = sum(
+        max(0, int(record.get("count") or 0))
+        for _model, model_records in ordered_groups
+        for record in model_records
+        if isinstance(record.get("count"), (int, float))
+        and not isinstance(record.get("count"), bool)
+    )
+    best = max(ratings, default=None)
 
-    group_html: list[str] = []
-    for index, (model, model_records) in enumerate(ordered_groups, start=1):
-        efforts: list[str] = []
-        for record in sorted(model_records, key=_iq_record_sort_key):
-            effort = _iq_scalar(record, "effort") or "—"
-            iq = _iq_number(record.get("iq"))
-            tone = _rate_tone(_finite_rate(record.get("iq")))
-            efforts.append(
-                '<div class="iq-effort">'
-                '<div class="iq-effort-info">'
-                f'<span class="iq-effort-label">EFFORT / {_e(effort)}</span>'
-                f"{_iq_details(record)}</div>"
-                f'<span class="val t-{tone}">{_e(iq)}<i>IQ</i></span>'
-                "</div>"
+    axes = ("off", "low", "medium", "high", "xhigh", "max", "ultra")
+    palette = (
+        "#4de8d2",
+        "#ac9cff",
+        "#72b7ff",
+        "#78d8a0",
+        "#c2e36c",
+        "#e5b76c",
+        "#e58fc4",
+        "#a6bacd",
+    )
+    chart_lines: list[str] = []
+    legend: list[str] = []
+    for index, (model, model_records) in enumerate(ordered_groups):
+        color = palette[index % len(palette)]
+        points: dict[int, tuple[float, dict[str, Any]]] = {}
+        for record in model_records:
+            effort = (_iq_scalar(record, "effort") or "default").casefold()
+            if effort in axes:
+                points[axes.index(effort)] = (
+                    _finite_rate(record.get("average")),
+                    record,
+                )
+        segments: list[str] = []
+        current: list[str] = []
+        point_html: list[str] = []
+        for axis, effort in enumerate(axes):
+            if axis not in points:
+                if current:
+                    segments.append(" ".join(current))
+                    current = []
+                continue
+            rating, record = points[axis]
+            if rating is None or not 0 <= rating <= 10:
+                if current:
+                    segments.append(" ".join(current))
+                    current = []
+                continue
+            x = 76 + axis * 88
+            y = 246 - rating * 20
+            current.append(f"{x:g},{y:g}")
+            score = _iq_number(rating)
+            count = record.get("count")
+            count_text = (
+                f"n={count}" if isinstance(count, int) and count >= 0 else "n=—"
             )
-        group_html.append(
-            '<section class="iq-model">'
-            '<header class="iq-model-head">'
-            f'<span class="idx">{index:02d}</span>'
-            f"<b>{_e(model)}</b>"
-            f'<span class="iq-model-count">{len(model_records)} 档</span>'
-            "</header>"
-            f'<div class="iq-efforts">{"".join(efforts)}</div>'
-            "</section>"
+            title = f"{_e(model)} · {_e(axes[axis])}：{score} / 10，{count_text}"
+            point_html.append(_iq_marker(index, x, y, color, title))
+        if current:
+            segments.append(" ".join(current))
+        paths = "".join(
+            f'<path class="iq-series-line" d="M {segment}" stroke="{color}"/>'
+            for segment in segments
         )
-    groups_html = "".join(group_html) or _empty_state("NO IQ MATCHES", "未找到匹配的模型效率记录")
-    heading = query if query else "模型效率榜"
-    label = "模糊搜索结果" if query else "按 IQ 排序"
+        chart_lines.append(
+            f'<g class="iq-series" data-model="{_e(model)}">{paths}{"".join(point_html)}</g>'
+        )
+        group_ratings = [
+            value
+            for record in model_records
+            if (value := _finite_rate(record.get("average"))) is not None
+        ]
+        group_best = _iq_number(max(group_ratings)) if group_ratings else "—"
+        group_count = sum(
+            count
+            for record in model_records
+            if isinstance((count := record.get("count")), int)
+            and not isinstance(count, bool)
+            and count >= 0
+        )
+        legend.append(
+            '<div class="iq-legend-item">'
+            f'<svg class="iq-legend-mark" viewBox="0 0 28 12" aria-hidden="true">'
+            f'<line x1="1" y1="6" x2="27" y2="6" stroke="{color}"/>'
+            f'{_iq_marker(index, 14, 6, color, "")}</svg>'
+            f'<span class="iq-legend-name">{_e(model)}</span>'
+            f'<span class="iq-legend-value"><b>{group_best}</b> /10 · n={group_count}</span>'
+            "</div>"
+        )
+    grid = "".join(
+        f'<line class="iq-grid" x1="44" y1="{246 - tick * 20}" x2="616" y2="{246 - tick * 20}"/>'
+        f'<text class="iq-axis-text" x="30" y="{250 - tick * 20}" text-anchor="end">{tick}</text>'
+        for tick in (0, 2, 4, 6, 8, 10)
+    )
+    axis_labels = "".join(
+        f'<text class="iq-effort-text" x="{76 + index * 88}" y="273" text-anchor="middle">{axis.upper()}</text>'
+        for index, axis in enumerate(axes)
+    )
+    chart = (
+        '<div class="iq-chart"><svg viewBox="0 0 648 292" role="img" '
+        'aria-label="各模型系列在不同推理档位的 0 到 10 分折线图">'
+        f"{grid}{axis_labels}{''.join(chart_lines)}</svg></div>"
+    )
+    groups_html = chart + f'<section class="iq-legend">{"".join(legend)}</section>'
+    if not ordered_groups:
+        groups_html = (
+            '<div class="iq-empty"><b>NO RATING MATCHES</b>'
+            "<small>未找到匹配的模型评分记录</small></div>"
+        )
+    heading = query if query else "模型智商检测"
+    label = "模糊搜索结果" if query else "近 7 天 · 峰值前 8 系列"
+    best_html = _iq_number(best) if best is not None else "—"
+    best_label = f"最高均分 / {len(ordered_groups)} 系列" if best is not None else "暂无评分"
     body = (
         '<article id="sub2api-iq">'
-        '<header class="brand">'
-        "<span>INTELLIGENCE IQ / 智能效率</span>"
-        f"<span>{_e(_timestamp(generated_at))}</span>"
+        '<header class="iq-brand">'
+        "<span>CODEXRADAR // MODEL RATINGS</span>"
+        f"<time>{_e(_timestamp(generated_at))}</time>"
         "</header>"
-        f"{_wave_motif()}"
-        '<header class="head">'
-        f"<div><h1>{_e(heading)}</h1></div>"
-        f'<div><div class="count">{len(ordered_groups)}<small>模型</small></div>'
-        f'<div class="count-label">{shown_records} 档 / {_e(label)}</div></div>'
+        '<header class="iq-head">'
+        f'<div><div class="iq-kicker">INTELLIGENCE / 智商检测</div><h1>{_e(heading)}</h1>'
+        f'<div class="iq-subtitle">{_e(label)} · 0–10 分</div></div>'
+        f'<div><div class="iq-best">{_e(best_html)}<small> /10</small></div>'
+        f'<div class="iq-best-label">{_e(best_label)}</div></div>'
         "</header>"
-        f'<section class="iq-groups">{groups_html}</section>'
-        f"{_wave_motif()}"
-        '<footer class="foot">'
-        "<span>基准 / DEEP-SWE</span>"
-        "<span>IQ、力度、均价、耗时与缓存命中率</span>"
+        '<div class="iq-summary">'
+        f"<span><b>{shown_records}</b>型号 / 档位</span>"
+        f"<span><b>{total_count}</b>评分总数</span>"
+        "</div>"
+        '<div class="iq-chart-caption">推理档位 / EFFORT　 ·　 折线 = 评分变化，非时间趋势</div>'
+        f"{groups_html}"
+        '<footer class="iq-foot">'
+        "<span>● PUBLIC DATA / 滚动 7 天</span>"
+        "<span>图例：峰值 / n 评分总数 · 无评分断线</span>"
         "</footer></article>"
     )
     return _document(_IQ_CSS, body)
@@ -1030,7 +1220,7 @@ async def render_iq_card(
     artifact_dir: Path,
     generated_at: int | None = None,
 ) -> str | None:
-    """Render the public intelligence-efficiency query board."""
+    """Render the public model-ratings query board."""
     return await _render_html(
         build_iq_html(records=records, query=query, generated_at=generated_at),
         selector="#sub2api-iq",

@@ -49,10 +49,7 @@ from .visual import (
     validated_artifact_image,
 )
 
-_IQ_API_URL = (
-    "https://api.codexradar.com/api/v1/intelligence-efficiency"
-    "?v=20260827-pompeii-trends-v1&benchmark=deep-swe"
-)
+_IQ_API_URL = "https://codexradar.com/api/model-ratings?view=public&window=7d"
 _MAX_IQ_RESPONSE_BYTES = 4 * 1024 * 1024
 _MAX_IQ_RECORDS = 2_000
 _MAX_IQ_MODELS = 8
@@ -76,49 +73,70 @@ def _finite_iq_value(value: Any) -> float | None:
 
 
 def _project_iq_records(payload: Any, query: str) -> list[dict[str, Any]]:
-    """Keep only public IQ fields and return complete bounded model groups."""
-    points = payload.get("points") if isinstance(payload, dict) else None
-    if not isinstance(points, list):
-        raise Sub2APIError("IQ 接口响应缺少 points 列表")
-    if len(points) > _MAX_IQ_RECORDS:
+    """保留公开评分字段，按系列返回完整且数量受限的分组。"""
+    models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(models, list):
+        raise Sub2APIError("IQ 接口响应缺少 models 列表")
+    if len(models) > _MAX_IQ_RECORDS:
         raise Sub2APIError(f"IQ 接口记录超过安全上限 {_MAX_IQ_RECORDS}")
 
     query_text = str(query or "").strip()
     query_key = _iq_search_key(query_text)
     records: list[tuple[int, float, dict[str, Any]]] = []
-    for raw in points:
+    for raw in models:
         if not isinstance(raw, dict):
             continue
-        model = str(raw.get("model") or "").strip()
-        model_key = _iq_search_key(model)
-        if not model or not model_key:
+        model = str(raw.get("group") or "").strip()
+        label = str(raw.get("label") or "").strip()
+        model_id = str(raw.get("id") or "").strip()
+        if not model or not label or not _iq_search_key(model):
             continue
-        direct_match = not query_key or query_key in model_key
-        similarity = (
-            difflib.SequenceMatcher(None, query_key, model_key).ratio()
-            if query_key
-            else 1.0
+        effort = label.removeprefix(model).strip() if label.startswith(model) else ""
+        search_keys = tuple(
+            key for value in (model, label, model_id) if (key := _iq_search_key(value))
+        )
+        direct_match = not query_key or any(query_key in key for key in search_keys)
+        similarity = max(
+            (
+                difflib.SequenceMatcher(None, query_key, key).ratio()
+                for key in search_keys
+            ),
+            default=0.0,
         )
         if query_key and not direct_match and similarity < 0.68:
             continue
-        iq = _finite_iq_value(raw.get("iq"))
+        count = raw.get("count")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            continue
+        average = _finite_iq_value(raw.get("average"))
         records.append(
             (
                 0 if direct_match else 1,
-                -(iq if iq is not None else -1.0),
+                -(average if average is not None else -1.0),
                 {
                     "model": model,
-                    "effort": str(raw.get("effort") or "").strip(),
-                    "iq": iq,
-                    "average_price_usd": _finite_iq_value(raw.get("average_price_usd")),
-                    "average_minutes": _finite_iq_value(raw.get("average_minutes")),
-                    "cache_hit_rate": _finite_iq_value(raw.get("cache_hit_rate")),
+                    "label": label,
+                    "effort": effort,
+                    "average": average,
+                    "count": count,
                 },
             )
         )
     groups: dict[str, list[tuple[int, float, dict[str, Any]]]] = {}
     for item in records:
         groups.setdefault(item[2]["model"], []).append(item)
+    if query_key:
+        direct_groups = {
+            model
+            for model, items in groups.items()
+            if any(item[0] == 0 for item in items)
+        }
+        if direct_groups:
+            groups = {
+                model: items
+                for model, items in groups.items()
+                if model in direct_groups
+            }
     selected: list[dict[str, Any]] = []
     selected_models: list[str] = []
     for _model, model_records in sorted(
@@ -131,7 +149,7 @@ def _project_iq_records(payload: Any, query: str) -> list[dict[str, Any]]:
     ):
         if len(selected_models) >= _MAX_IQ_MODELS:
             break
-        selected.extend(record for _match, _iq, record in model_records)
+        selected.extend(record for _match, _average, record in model_records)
         selected_models.append(_model)
     return selected
 
@@ -2452,7 +2470,7 @@ def _format_subscription_line(record: dict[str, Any]) -> str:
 
 def _format_iq_records(records: list[dict[str, Any]], *, query: str) -> str:
     """Format public IQ results when the optional image path is unavailable."""
-    title = f"IQ 查询“{query}”" if query else "模型 IQ 效率榜"
+    title = f"IQ 查询“{query}”" if query else "模型 IQ 评分榜"
     groups: dict[str, list[dict[str, Any]]] = {}
     for record in records:
         model = str(record.get("model") or "未知模型")
@@ -2461,20 +2479,14 @@ def _format_iq_records(records: list[dict[str, Any]], *, query: str) -> str:
     for model, model_records in groups.items():
         lines.append(f"· {model}")
         for record in model_records:
-            effort = str(record.get("effort") or "—")
-            iq = _finite_iq_value(record.get("iq"))
-            price = _finite_iq_value(record.get("average_price_usd"))
-            minutes = _finite_iq_value(record.get("average_minutes"))
-            cache = _finite_iq_value(record.get("cache_hit_rate"))
-            iq_text = f"{iq:g}" if iq is not None else "—"
-            price_text = f"${price:.3f}" if price is not None else "—"
-            minutes_text = f"{minutes:g} 分" if minutes is not None else "—"
-            cache_text = f"{cache * 100:.1f}%" if cache is not None else "—"
-            lines.append(
-                f"  - {effort}（IQ: {iq_text}，均价: {price_text}，"
-                f"耗时: {minutes_text}，缓存: {cache_text}）"
-            )
-    return f"{title}（{len(groups)} 个模型 / {len(records)} 档）\n" + "\n".join(lines)
+            label = str(record.get("label") or record.get("effort") or "—")
+            average = _finite_iq_value(record.get("average"))
+            count = record.get("count")
+            average_text = f"{average:g}" if average is not None else "—"
+            lines.append(f"  - {label}（平均分: {average_text}，样本数: {count}）")
+    return f"{title}（近 7 天，0–10 分；{len(groups)} 个模型 / {len(records)} 档）\n" + "\n".join(
+        lines
+    )
 
 
 def _format_records(
