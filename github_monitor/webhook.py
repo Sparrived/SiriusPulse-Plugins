@@ -303,7 +303,18 @@ class _HeaderTimeoutRequestHandler(_AiohttpRequestHandler):
                 self._arm_header_timeout()
 
     def _headers_complete(self) -> bool:
-        return bool(self._messages or self._payload_parser is not None or self._upgrade)
+        return bool(self._messages or self._payload_parser is not None or self._is_upgraded())
+
+    def _is_upgraded(self) -> bool:
+        """Return whether the connection switched to another protocol.
+
+        aiohttp 3.13 names this private flag ``_upgrade`` while 3.14 renamed it
+        to ``_upgraded``; probe both and treat an absent flag as "not
+        upgraded" so that header accounting stays correct on either version.
+        """
+        if hasattr(self, "_upgraded"):
+            return bool(self._upgraded)
+        return bool(getattr(self, "_upgrade", False))
 
     def _arm_header_timeout(self) -> None:
         self._cancel_header_timeout()
