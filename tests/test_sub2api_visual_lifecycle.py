@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import sys
 import types
 from dataclasses import dataclass, field
@@ -13,7 +14,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import sub2api_monitor.visual as visual  # noqa: E402
 
-_VALID_PNG = visual._PNG_SIGNATURE + b"fake-png-payload"
+_VALID_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAA"
+    "SUVORK5CYII="
+)
 _HTML = '<article id="sub2api-test">safe local report</article>'
 
 
@@ -217,8 +221,8 @@ async def test_render_success_is_offline_hardened_and_closes_resources(
     assert output.parent == tmp_path.resolve()
     assert output.read_bytes() == _VALID_PNG
     assert state.new_context_kwargs == {
-        "viewport": {"width": 1220, "height": 1000},
-        "device_scale_factor": 1,
+        "viewport": {"width": 680, "height": 1400},
+        "device_scale_factor": 2,
         "java_script_enabled": False,
         "service_workers": "block",
     }

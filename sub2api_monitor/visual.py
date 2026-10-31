@@ -1391,20 +1391,29 @@ def _consume_task_result(task: asyncio.Task[Any]) -> None:
 
 
 async def prune_artifacts(output_dir: Path) -> None:
-    """Delete stale and oversized artifacts, keeping recent bounded PNG files."""
+    """Delete stale and oversized Sub2API artifacts, keeping recent images."""
     root = _artifact_root(output_dir)
     try:
-        candidates = [path for path in root.iterdir() if path.is_file()]
+        candidates = [
+            path
+            for path in root.iterdir()
+            if path.is_file()
+            and path.name.startswith("sub2api_")
+            and path.name.endswith(".png")
+        ]
     except OSError:
         return
     keep: list[tuple[float, int, Path]] = []
     freed = 0
     for path in candidates:
+        if path.is_symlink():
+            _quiet_unlink(path)
+            continue
         try:
             stat = path.stat()
         except OSError:
             continue
-        if path.name.endswith(".tmp.png") or not path.name.endswith(".png"):
+        if path.name.endswith(".tmp.png"):
             freed += stat.st_size
             _quiet_unlink(path)
             continue
@@ -1422,7 +1431,7 @@ async def prune_artifacts(output_dir: Path) -> None:
             continue
         total += size
         survivors.append((mtime, size, path))
-    for path in root.glob("*.tmp.png"):
+    for path in root.glob("sub2api_*.tmp.png"):
         _quiet_unlink(path)
     if survivors:
         newest = survivors[0][0]
@@ -1463,6 +1472,8 @@ def _get_render_slots() -> asyncio.Semaphore:
 
 def _artifact_root(output_dir: Path) -> Path:
     root = Path(output_dir)
+    if root.is_symlink():
+        raise ValueError("可视化 artifact 目录无效")
     root.mkdir(parents=True, exist_ok=True)
     return root
 

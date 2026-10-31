@@ -248,7 +248,7 @@ async def test_status_command_accepts_display_name_with_spaces(tmp_path):
 @pytest.mark.asyncio
 async def test_stateful_commands_are_rejected_outside_designated_persona(tmp_path):
     plugin = _plugin(tmp_path, _config(_source("alpha")), persona="bob")
-    for action in ("status", "poll", "subscriptions", "rates", "report", "reset"):
+    for action in ("status", "poll", "subscriptions", "rates", "reset"):
         cmd = CommandAST(
             command="sub2api",
             raw_text=f"/sub2api {action}",

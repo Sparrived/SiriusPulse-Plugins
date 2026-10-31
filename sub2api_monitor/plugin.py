@@ -548,7 +548,6 @@ class Sub2APIMonitorPlugin(PluginBase):
                     "password": {
                         "label": "登录密码",
                         "help": "留空时回退到环境变量；已保存后留空保持不变。",
-                        "placeholder": "已保存（留空保持不变）",
                         "span": 6,
                     },
                 },

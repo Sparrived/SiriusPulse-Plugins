@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import sys
@@ -30,6 +31,11 @@ from sub2api_monitor.visual import (  # noqa: E402
 )
 
 from sirius_pulse.plugins.context import PluginDataStore  # noqa: E402
+
+_VALID_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAA"
+    "SUVORK5CYII="
+)
 
 
 def _source(
@@ -104,7 +110,7 @@ def test_source_parser_maps_ids_display_names_credentials_and_selectors(monkeypa
         ([_source("Alpha")], "id"),
         ([_source("1alpha")], "id"),
         ([_source("alpha"), _source("alpha")], "重复"),
-        ([{**_source("alpha"), "email": "bad@example.invalid"}], "未声明字段"),
+        ([{**_source("alpha"), "unknown_field": "x"}], "未声明字段"),
         ([{**_source("alpha"), "enabled": "true"}], "enabled"),
         ([{**_source("alpha"), "allow_insecure_http": "false"}], "allow_insecure"),
         ([{**_source("alpha"), "inherit_notify_group_ids": "true"}], "inherit"),
@@ -318,7 +324,7 @@ async def test_multisite_notification_acks_and_images_are_source_scoped(
     async def fake_render_change_card(**kwargs):
         output = Path(kwargs["artifact_dir"]) / f"sub2api_{kwargs['source_id']}.png"
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_bytes(b"\x89PNG\r\n\x1a\ncard")
+        output.write_bytes(_VALID_PNG)
         return str(output.resolve())
 
     monkeypatch.setattr(Sub2APIMonitorPlugin, "_get_client", fake_get_client)
@@ -705,11 +711,11 @@ def test_validated_artifact_image_rejects_non_png_and_outside_paths(tmp_path):
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
     good = artifacts / "sub2api_good.png"
-    good.write_bytes(b"\x89PNG\r\n\x1a\nvalid")
+    good.write_bytes(_VALID_PNG)
     bad = artifacts / "sub2api_bad.png"
     bad.write_bytes(b"not-png")
     outside = tmp_path / "outside.png"
-    outside.write_bytes(b"\x89PNG\r\n\x1a\nvalid")
+    outside.write_bytes(_VALID_PNG)
 
     assert validated_artifact_image(artifacts, good) == str(good.resolve())
     assert validated_artifact_image(artifacts, bad) == ""
@@ -725,11 +731,11 @@ async def test_artifact_pruning_bounds_only_sub2api_images(tmp_path):
     unrelated.write_bytes(b"unrelated")
     now = time.time()
     old = tmp_path / "sub2api_old.png"
-    old.write_bytes(b"\x89PNG\r\n\x1a\nold")
+    old.write_bytes(_VALID_PNG)
     os.utime(old, (now - 90_000, now - 90_000))
     for index in range(35):
         path = tmp_path / f"sub2api_{index:02d}.png"
-        path.write_bytes(b"\x89PNG\r\n\x1a\nnew")
+        path.write_bytes(_VALID_PNG)
         os.utime(path, (now + index, now + index))
 
     await prune_artifacts(tmp_path)
@@ -793,7 +799,7 @@ def test_sub2api_declares_visual_multisite_schema_without_credentials():
     definition = PluginDefinition.from_class(Sub2APIMonitorPlugin)
     schema = definition.ui_schema
 
-    assert definition.version == "0.3.0"
+    assert definition.version == Sub2APIMonitorPlugin._plugin_version
     assert definition.min_framework_version == "1.3.0"
     assert schema["version"] == 1
     assert schema["layout"] == "wide"
@@ -811,6 +817,7 @@ def test_sub2api_declares_visual_multisite_schema_without_credentials():
     assert [fieldset["id"] for fieldset in sources["fieldsets"]] == [
         "identity",
         "session",
+        "credentials",
         "monitoring",
         "notifications",
     ]
@@ -818,14 +825,23 @@ def test_sub2api_declares_visual_multisite_schema_without_credentials():
         parameter.name.casefold() for parameter in definition.parameters
     }
     declared_source_fields = {
-        str(field.get("name", "")).casefold()
+        str(field.get("name", "")).casefold(): field
         for parameter in definition.parameters
         if parameter.name == "sources"
         for field in parameter.fields or []
     }
-    for forbidden in ("email", "password", "access_token", "refresh_token"):
+    assert "email" not in declared_parameter_names
+    assert "password" not in declared_parameter_names
+    assert declared_source_fields["email"]["type"] == "str"
+    assert declared_source_fields["password"]["type"] == "password"
+    for forbidden in ("access_token", "refresh_token"):
         assert forbidden not in declared_parameter_names
         assert forbidden not in declared_source_fields
+    password_ui = sources["fields"]["password"]
+    assert "placeholder" not in password_ui
+    assert declared_source_fields["email"].get("default") == ""
+    assert declared_source_fields["password"].get("default") == ""
+    assert "secret" not in json.dumps(schema, ensure_ascii=False).casefold()
     assert "SUB2API_{ID}_EMAIL" in sources["help"]
     assert "SUB2API_{ID}_PASSWORD" in sources["help"]
 
