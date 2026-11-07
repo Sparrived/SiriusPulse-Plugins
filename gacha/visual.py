@@ -15,7 +15,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from .members import STAT_KEYS
-from .store import Card, Owned
+from .store import KIND_MOMENT, KIND_MOOD, MAX_STARS, Card, Owned
 
 CARD_W, CARD_H = 600, 900
 
@@ -126,36 +126,72 @@ def _avatar(avatar: bytes | None, name: str, size: int) -> Image.Image:
     return out
 
 
-def render_card(card: Card, *, avatar: bytes | None, persona_name: str) -> bytes:
-    """一张收藏卡，600×900 PNG。"""
+def _stars(stars: int) -> str:
+    return "★" * stars + "☆" * (MAX_STARS - stars)
+
+
+def _version(card: Card) -> str:
+    stamp = card.minted_at[:10].replace("-", ".") if card.minted_at else ""
+    if card.kind == KIND_MOMENT:
+        return f"名场面 · {stamp}" if stamp else "名场面"
+    label = "心情卡" if card.kind == KIND_MOOD else "初版"
+    return f"{label} · {stamp[:7]}" if stamp else label
+
+
+def render_card(
+    card: Card,
+    *,
+    avatar: bytes | None,
+    persona_name: str,
+    stars: int = 1,
+    extra_notes: list[str] | None = None,
+) -> bytes:
+    """一张收藏卡（600 宽）。升过星的卡会多出她写给收藏者的话，卡也跟着变长。"""
     rarity_color = RARITY_COLORS.get(card.rarity, RARITY_COLORS["R"])
-    base = _night((CARD_W, CARD_H), card.card_id).convert("RGBA")
+    measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    note_font = _font(21, cute=True)
+    note_lines = _wrap(measure, f"—— {persona_name}：{card.note}", note_font, CARD_W - 120)[:3]
+    extra_lines = [
+        line
+        for note in (extra_notes or [])
+        # 可爱字体里没有 ✦ 这类符号，前缀只用汉字。
+        for line in _wrap(measure, f"悄悄话：{note}", note_font, CARD_W - 120)[:2]
+    ]
+    height = CARD_H + 30 * len(extra_lines)
+
+    base = _night((CARD_W, height), card.card_id).convert("RGBA")
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
-    # 外框与内框
+    # 外框与内框；UR 多一圈
     draw.rounded_rectangle(
-        [10, 10, CARD_W - 11, CARD_H - 11], radius=28, outline=rarity_color, width=4
+        [10, 10, CARD_W - 11, height - 11], radius=28, outline=rarity_color, width=4
     )
     draw.rounded_rectangle(
-        [22, 22, CARD_W - 23, CARD_H - 23], radius=20, outline=(*_SILVER, 90), width=1
+        [22, 22, CARD_W - 23, height - 23], radius=20, outline=(*_SILVER, 90), width=1
     )
+    if card.kind == KIND_MOMENT:
+        draw.rounded_rectangle(
+            [16, 16, CARD_W - 17, height - 17], radius=24, outline=(*rarity_color, 140), width=2
+        )
 
-    # 顶栏：编号、稀有度、版本
+    # 顶栏：编号与星级、版本、稀有度
     small = _font(20)
     draw.text((44, 40), card.label, font=_font(22, bold=True), fill=_SILVER)
+    if stars > 1:
+        draw.text((44, 68), _stars(stars), font=_font(18, bold=True), fill=_GOLD)
     badge = _font(22, bold=True)
     badge_w = draw.textlength(card.rarity, font=badge) + 28
     draw.rounded_rectangle(
         [CARD_W - 44 - badge_w, 36, CARD_W - 44, 72], radius=18, fill=(*rarity_color, 230)
     )
     draw.text((CARD_W - 44 - badge_w + 14, 40), card.rarity, font=badge, fill=_NIGHT_TOP)
-    version = f"初版 · {card.minted_at[:7].replace('-', '.')}" if card.minted_at else "初版"
-    _centered(draw, 44, version, small, _FAINT)
+    _centered(draw, 44, _version(card), small, _FAINT)
+    if card.supply:
+        _centered(draw, 70, f"限量 {card.issued}/{card.supply}", _font(17), rarity_color)
 
-    # 头像，带一圈月光
-    size = 240
-    cx, top = CARD_W // 2, 96
+    size = 160 if card.kind == KIND_MOMENT else 240
+    cx, top = CARD_W // 2, 100 if card.kind == KIND_MOMENT else 96
     glow = Image.new("RGBA", base.size, (0, 0, 0, 0))
     ImageDraw.Draw(glow).ellipse(
         [cx - size // 2 - 18, top - 18, cx + size // 2 + 18, top + size + 18],
@@ -166,11 +202,39 @@ def render_card(card: Card, *, avatar: bytes | None, persona_name: str) -> bytes
         [cx - size // 2 - 5, top - 5, cx + size // 2 + 5, top + size + 5], outline=_SILVER, width=3
     )
 
-    # 名字与称号
+    if card.kind == KIND_MOMENT:
+        y = _moment_body(draw, card, rarity_color)
+    else:
+        y = _member_body(draw, card, rarity_color)
+
+    # 技能
+    skill_top = y + 14
+    skill_font = _font(21)
+    skill_lines = _wrap(draw, card.skill_text, skill_font, CARD_W - 140)[:3]
+    skill_bottom = skill_top + 48 + 30 * len(skill_lines)
+    draw.rounded_rectangle([48, skill_top, CARD_W - 48, skill_bottom], radius=16, fill=_PANEL)
+    draw.text((70, skill_top + 12), f"技能【{card.skill_name}】", font=_font(23, bold=True), fill=_GOLD)
+    for index, line in enumerate(skill_lines):
+        draw.text((70, skill_top + 46 + 30 * index), line, font=skill_font, fill=_SILVER)
+
+    # 她的批注，以及升星后只写给这位收藏者的话
+    note_top = height - 50 - 30 * (len(note_lines) + len(extra_lines))
+    for index, line in enumerate(note_lines):
+        draw.text((60, note_top + 30 * index), line, font=note_font, fill=_SOFT)
+    for index, line in enumerate(extra_lines):
+        draw.text((60, note_top + 30 * (len(note_lines) + index)), line, font=note_font, fill=_GOLD)
+
+    base = Image.alpha_composite(base, overlay)
+    base.alpha_composite(_avatar(avatar, card.subject_name, size), (cx - size // 2, top))
+    out = io.BytesIO()
+    base.convert("RGB").save(out, format="PNG", optimize=True)
+    return out.getvalue()
+
+
+def _member_body(draw: ImageDraw.ImageDraw, card: Card, rarity_color) -> int:
+    """人物卡：名字、称号、五项属性。返回下一块的起点。"""
     _centered(draw, 360, card.subject_name[:14], _font(36, bold=True), _SILVER)
     _centered(draw, 410, f"「{card.title}」", _font(30, cute=True), _GOLD)
-
-    # 属性条
     y = 470
     label_font, value_font = _font(21), _font(21, bold=True)
     for key in STAT_KEYS:
@@ -191,29 +255,27 @@ def render_card(card: Card, *, avatar: bytes | None, persona_name: str) -> bytes
             fill=_SILVER,
         )
         y += 36
+    return y
 
-    # 技能
-    skill_top = y + 14
-    skill_font = _font(21)
-    skill_lines = _wrap(draw, card.skill_text, skill_font, CARD_W - 140)[:3]
-    skill_bottom = skill_top + 48 + 30 * len(skill_lines)
-    draw.rounded_rectangle([48, skill_top, CARD_W - 48, skill_bottom], radius=16, fill=_PANEL)
-    draw.text((70, skill_top + 12), f"技能【{card.skill_name}】", font=_font(23, bold=True), fill=_GOLD)
-    for index, line in enumerate(skill_lines):
-        draw.text((70, skill_top + 46 + 30 * index), line, font=skill_font, fill=_SILVER)
 
-    # 她的批注
-    note_font = _font(21, cute=True)
-    note_lines = _wrap(draw, f"—— {persona_name}：{card.note}", note_font, CARD_W - 120)[:3]
-    note_top = CARD_H - 50 - 30 * len(note_lines)
-    for index, line in enumerate(note_lines):
-        draw.text((60, note_top + 30 * index), line, font=note_font, fill=_SOFT)
-
-    base = Image.alpha_composite(base, overlay)
-    base.alpha_composite(_avatar(avatar, card.subject_name, size), (cx - size // 2, top))
-    out = io.BytesIO()
-    base.convert("RGB").save(out, format="PNG", optimize=True)
-    return out.getvalue()
+def _moment_body(draw: ImageDraw.ImageDraw, card: Card, rarity_color) -> int:
+    """名场面：名字、那句原话和说话的人、出演名单。返回下一块的起点。"""
+    _centered(draw, 284, f"「{card.title}」", _font(34, cute=True), _GOLD)
+    quote_font = _font(25, bold=True)
+    quote_lines = _wrap(draw, f"“{card.quote}”", quote_font, CARD_W - 130)[:4]
+    y = 344
+    for line in quote_lines:
+        _centered(draw, y, line, quote_font, _SILVER)
+        y += 36
+    who = f"—— {card.subject_name}"
+    font = _font(20)
+    draw.text((CARD_W - 70 - draw.textlength(who, font=font), y + 4), who, font=font, fill=_SOFT)
+    y += 44
+    cast_font = _font(19)
+    for line in _wrap(draw, "出演：" + "、".join(card.cast_names), cast_font, CARD_W - 130)[:2]:
+        draw.text((64, y), line, font=cast_font, fill=rarity_color)
+        y += 28
+    return max(y, 560)
 
 
 _CELL_W, _CELL_H, _GAP, _COLS = 220, 132, 16, 4
@@ -223,7 +285,7 @@ def render_collection(
     *, owner_name: str, owned: list[Owned], pool: list[Card], persona_name: str
 ) -> bytes:
     """图鉴：本群卡池里的每一张，收到的亮着，没收到的是问号。"""
-    have = {item.card.card_id: item.copies for item in owned}
+    have = {item.card.card_id: item for item in owned}
     rows = max(1, -(-len(pool) // _COLS))
     width = _COLS * _CELL_W + (_COLS + 1) * _GAP
     height = 150 + rows * (_CELL_H + _GAP) + 40
@@ -245,8 +307,8 @@ def render_collection(
         x = _GAP + col * (_CELL_W + _GAP)
         y = 150 + row * (_CELL_H + _GAP)
         color = RARITY_COLORS.get(card.rarity, RARITY_COLORS["R"])
-        copies = have.get(card.card_id)
-        if copies:
+        item = have.get(card.card_id)
+        if item:
             draw.rounded_rectangle(
                 [x, y, x + _CELL_W, y + _CELL_H],
                 radius=14,
@@ -255,12 +317,20 @@ def render_collection(
                 width=2,
             )
             draw.text((x + 14, y + 10), f"{card.label} · {card.rarity}", font=_font(17), fill=color)
-            draw.text(
-                (x + 14, y + 38), card.subject_name[:8], font=_font(24, bold=True), fill=_SILVER
-            )
-            draw.text((x + 14, y + 74), card.title[:10], font=_font(18, cute=True), fill=_GOLD)
-            if copies > 1:
-                mark = f"×{copies}"
+            if item.stars > 1:
+                mark = _stars(item.stars)
+                font = _font(16, bold=True)
+                draw.text(
+                    (x + _CELL_W - 14 - draw.textlength(mark, font=font), y + 12),
+                    mark,
+                    font=font,
+                    fill=_GOLD,
+                )
+            draw.text((x + 14, y + 38), card.name[:8], font=_font(24, bold=True), fill=_SILVER)
+            subtitle = card.subject_name if card.kind == KIND_MOMENT else card.title
+            draw.text((x + 14, y + 74), subtitle[:10], font=_font(18, cute=True), fill=_GOLD)
+            if item.copies > 1:
+                mark = f"×{item.copies}"
                 font = _font(18, bold=True)
                 draw.text(
                     (x + _CELL_W - 14 - draw.textlength(mark, font=font), y + 100),
@@ -278,6 +348,10 @@ def render_collection(
             )
             draw.text((x + 14, y + 10), card.label, font=_font(17), fill=_FAINT)
             _centered_in(draw, x, y + 40, _CELL_W, "？？？", _font(30, bold=True), _FAINT)
+            if card.supply:
+                # 没抽到的限量卡也让人知道它还剩几份：这是交换的筹码。
+                hint = "已发完" if card.sold_out else f"限量 {card.issued}/{card.supply}"
+                _centered_in(draw, x, y + 92, _CELL_W, hint, _font(16), color)
 
     base = Image.alpha_composite(base, overlay)
     out = io.BytesIO()

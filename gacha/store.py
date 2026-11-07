@@ -1,9 +1,15 @@
 """群友图鉴的持久化：一个人格一份 SQLite（``artifacts/gacha/gacha.db``）。
 
-不用 PluginDataStore：它每次写入都整份重写 JSON、也没有锁，抽卡与收藏需要
-"扣次数 + 发卡"在同一个事务里完成，一次失败不能只做一半。
+不用 PluginDataStore：它每次写入都整份重写 JSON、也没有锁，抽卡、送卡和交换都需要
+"扣掉一边 + 加到另一边"在同一个事务里完成，一次失败不能只做一半。
 
 卡池按群隔离：同一个人在两个群里是两张不同的卡，各自只用那个群里的公开发言写成。
+
+卡有三种：
+
+- ``member``：每人一张的常驻卡（R）；
+- ``mood``：她心情好时给某人画的变体（SR）；
+- ``moment``：群里的名场面（UR），引用一句原话，限量发行。
 """
 
 from __future__ import annotations
@@ -14,8 +20,15 @@ import threading
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
+
+KIND_MEMBER = "member"
+KIND_MOOD = "mood"
+KIND_MOMENT = "moment"
+
+MAX_STARS = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cards (
@@ -66,7 +79,46 @@ CREATE TABLE IF NOT EXISTS opted_out (
     at         TEXT NOT NULL,
     PRIMARY KEY (group_id, subject_id)
 );
+
+CREATE TABLE IF NOT EXISTS offers (
+    offer_id   TEXT PRIMARY KEY,
+    group_id   TEXT NOT NULL,
+    from_id    TEXT NOT NULL,
+    from_name  TEXT NOT NULL,
+    to_id      TEXT NOT NULL,
+    give_card  TEXT NOT NULL,
+    want_card  TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
+
+# 第一期之后加的列：老库打开时补上，已有的卡保持原样（都是 member）。
+_ADDED_COLUMNS = {
+    "cards": {
+        "kind": "TEXT NOT NULL DEFAULT 'member'",
+        "quote": "TEXT NOT NULL DEFAULT ''",
+        "cast_ids": "TEXT NOT NULL DEFAULT '[]'",
+        "cast_names": "TEXT NOT NULL DEFAULT '[]'",
+        "supply": "INTEGER NOT NULL DEFAULT 0",
+        "issued": "INTEGER NOT NULL DEFAULT 0",
+    },
+    "owned": {
+        "stars": "INTEGER NOT NULL DEFAULT 1",
+        "notes": "TEXT NOT NULL DEFAULT '[]'",
+    },
+}
+
+
+class SoldOut(Exception):
+    """限量卡已经全部发出。"""
+
+
+def _json_list(value: Any) -> list[str]:
+    try:
+        loaded = json.loads(value or "[]")
+    except ValueError:
+        return []
+    return [str(item) for item in loaded] if isinstance(loaded, list) else []
 
 
 @dataclass(slots=True)
@@ -84,10 +136,28 @@ class Card:
     note: str
     stats: dict[str, int | None] = field(default_factory=dict)
     minted_at: str = ""
+    kind: str = KIND_MEMBER
+    quote: str = ""
+    cast_ids: list[str] = field(default_factory=list)
+    cast_names: list[str] = field(default_factory=list)
+    supply: int = 0
+    issued: int = 0
 
     @property
     def label(self) -> str:
         return f"No.{self.no:03d}"
+
+    @property
+    def name(self) -> str:
+        """在台词和图鉴里怎么称呼这张卡：人物卡是人名，名场面是它的名字。"""
+        return self.title if self.kind == KIND_MOMENT else self.subject_name
+
+    @property
+    def sold_out(self) -> bool:
+        return self.supply > 0 and self.issued >= self.supply
+
+    def involves(self, user_id: str) -> bool:
+        return self.subject_id == user_id or user_id in self.cast_ids
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Card":
@@ -109,6 +179,12 @@ class Card:
             note=row["note"],
             stats=stats if isinstance(stats, dict) else {},
             minted_at=row["minted_at"],
+            kind=row["kind"],
+            quote=row["quote"],
+            cast_ids=_json_list(row["cast_ids"]),
+            cast_names=_json_list(row["cast_names"]),
+            supply=int(row["supply"]),
+            issued=int(row["issued"]),
         )
 
 
@@ -128,6 +204,20 @@ class Player:
 class Owned:
     card: Card
     copies: int
+    stars: int = 1
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class Offer:
+    offer_id: str
+    group_id: str
+    from_id: str
+    from_name: str
+    to_id: str
+    give_card: str
+    want_card: str
+    created_at: str
 
 
 class GachaStore:
@@ -139,6 +229,11 @@ class GachaStore:
         self._lock = threading.RLock()
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            for table, columns in _ADDED_COLUMNS.items():
+                have = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+                for name, decl in columns.items():
+                    if name not in have:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -167,6 +262,11 @@ class GachaStore:
         note: str,
         stats: dict[str, Any],
         now: str,
+        kind: str = KIND_MEMBER,
+        quote: str = "",
+        cast_ids: list[str] | None = None,
+        cast_names: list[str] | None = None,
+        supply: int = 0,
     ) -> Card:
         with self._connect() as conn:
             row = conn.execute(
@@ -186,9 +286,17 @@ class GachaStore:
                 note=note,
                 stats=dict(stats),
                 minted_at=now,
+                kind=kind,
+                quote=quote,
+                cast_ids=list(cast_ids or []),
+                cast_names=list(cast_names or []),
+                supply=supply,
             )
             conn.execute(
-                "INSERT INTO cards VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                """INSERT INTO cards (card_id, group_id, no, subject_id, subject_name,
+                    subject_uid, rarity, title, skill_name, skill_text, note, stats, minted_at,
+                    kind, quote, cast_ids, cast_names, supply, issued)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)""",
                 (
                     card.card_id,
                     card.group_id,
@@ -203,6 +311,11 @@ class GachaStore:
                     card.note,
                     json.dumps(card.stats, ensure_ascii=False),
                     card.minted_at,
+                    card.kind,
+                    card.quote,
+                    json.dumps(card.cast_ids, ensure_ascii=False),
+                    json.dumps(card.cast_names, ensure_ascii=False),
+                    card.supply,
                 ),
             )
         return card
@@ -214,20 +327,41 @@ class GachaStore:
             ).fetchall()
         return [Card.from_row(row) for row in rows]
 
-    def card_of(self, group_id: str, subject_id: str) -> Card | None:
+    def card(self, group_id: str, card_id: str) -> Card | None:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT * FROM cards WHERE group_id = ? AND subject_id = ? ORDER BY no LIMIT 1",
-                (group_id, subject_id),
+                "SELECT * FROM cards WHERE group_id = ? AND card_id = ?", (group_id, card_id)
+            ).fetchone()
+        return Card.from_row(row) if row else None
+
+    def card_of(self, group_id: str, subject_id: str) -> Card | None:
+        """这个人的常驻卡（不含心情卡和名场面）。"""
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT * FROM cards WHERE group_id = ? AND subject_id = ? AND kind = ?
+                ORDER BY no LIMIT 1""",
+                (group_id, subject_id, KIND_MEMBER),
             ).fetchone()
         return Card.from_row(row) if row else None
 
     def subjects_with_cards(self, group_id: str) -> set[str]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT DISTINCT subject_id FROM cards WHERE group_id = ?", (group_id,)
+                "SELECT DISTINCT subject_id FROM cards WHERE group_id = ? AND kind = ?",
+                (group_id, KIND_MEMBER),
             ).fetchall()
         return {row[0] for row in rows}
+
+    def last_minted(self, group_id: str, kind: str, subject_id: str = "") -> str:
+        """某类卡（可限定某个人）最近一次发行的时间，没有则为空串。"""
+        sql = "SELECT MAX(minted_at) FROM cards WHERE group_id = ? AND kind = ?"
+        params: tuple[str, ...] = (group_id, kind)
+        if subject_id:
+            sql += " AND subject_id = ?"
+            params += (subject_id,)
+        with self._connect() as conn:
+            row = conn.execute(sql, params).fetchone()
+        return str(row[0] or "")
 
     # ── 哪些群在玩 ────────────────────────────────────────────────────
 
@@ -244,20 +378,19 @@ class GachaStore:
     # ── 退出与加入 ────────────────────────────────────────────────────
 
     def opt_out(self, group_id: str, subject_id: str, now: str) -> int:
-        """退出图鉴：删掉这个人在本群的卡，连同所有人手里的那几张。返回删掉的张数。"""
+        """退出图鉴：删掉本群里画了这个人的所有卡（包括他出演的名场面），
+        连同所有人手里的那几张。返回删掉的张数。"""
         with self._connect() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO opted_out VALUES (?, ?, ?)", (group_id, subject_id, now)
             )
-            ids = [
-                row[0]
-                for row in conn.execute(
-                    "SELECT card_id FROM cards WHERE group_id = ? AND subject_id = ?",
-                    (group_id, subject_id),
-                ).fetchall()
-            ]
+            rows = conn.execute("SELECT * FROM cards WHERE group_id = ?", (group_id,)).fetchall()
+            ids = [row["card_id"] for row in rows if Card.from_row(row).involves(subject_id)]
             for card_id in ids:
                 conn.execute("DELETE FROM owned WHERE card_id = ?", (card_id,))
+                conn.execute(
+                    "DELETE FROM offers WHERE give_card = ? OR want_card = ?", (card_id,) * 2
+                )
                 conn.execute("DELETE FROM cards WHERE card_id = ?", (card_id,))
         return len(ids)
 
@@ -302,8 +435,18 @@ class GachaStore:
         pity_after: int,
         now: str,
     ) -> int:
-        """一次抽卡：扣当天次数、更新保底、把卡放进收藏。返回这张卡现在有几份。"""
+        """一次抽卡：扣当天次数、更新保底、把卡放进收藏。返回这张卡现在有几份。
+
+        限量卡在同一个事务里占一份名额；名额已满时抛 SoldOut，什么也不扣。
+        """
         with self._connect() as conn:
+            if card.supply > 0:
+                taken = conn.execute(
+                    "UPDATE cards SET issued = issued + 1 WHERE card_id = ? AND issued < supply",
+                    (card.card_id,),
+                ).rowcount
+                if not taken:
+                    raise SoldOut(card.card_id)
             row = conn.execute(
                 "SELECT draw_date, draws_today FROM players WHERE group_id = ? AND owner_id = ?",
                 (group_id, owner_id),
@@ -319,12 +462,7 @@ class GachaStore:
                     pity = excluded.pity""",
                 (group_id, owner_id, today, used + 1, pity_after),
             )
-            conn.execute(
-                """INSERT INTO owned (group_id, owner_id, card_id, copies, first_at)
-                VALUES (?, ?, ?, 1, ?)
-                ON CONFLICT (group_id, owner_id, card_id) DO UPDATE SET copies = copies + 1""",
-                (group_id, owner_id, card.card_id, now),
-            )
+            _give(conn, group_id, owner_id, card.card_id, now)
             copies = conn.execute(
                 "SELECT copies FROM owned WHERE group_id = ? AND owner_id = ? AND card_id = ?",
                 (group_id, owner_id, card.card_id),
@@ -334,10 +472,164 @@ class GachaStore:
     def collection(self, group_id: str, owner_id: str) -> list[Owned]:
         with self._connect() as conn:
             rows = conn.execute(
-                """SELECT cards.*, owned.copies AS copies FROM owned
+                """SELECT cards.*, owned.copies AS copies, owned.stars AS stars,
+                    owned.notes AS notes FROM owned
                 JOIN cards ON cards.card_id = owned.card_id
                 WHERE owned.group_id = ? AND owned.owner_id = ?
                 ORDER BY cards.no""",
                 (group_id, owner_id),
             ).fetchall()
-        return [Owned(card=Card.from_row(row), copies=int(row["copies"])) for row in rows]
+        return [
+            Owned(
+                card=Card.from_row(row),
+                copies=int(row["copies"]),
+                stars=int(row["stars"]),
+                notes=_json_list(row["notes"]),
+            )
+            for row in rows
+        ]
+
+    def owned(self, group_id: str, owner_id: str, card_id: str) -> Owned | None:
+        for item in self.collection(group_id, owner_id):
+            if item.card.card_id == card_id:
+                return item
+        return None
+
+    # ── 送卡、交换、升星 ──────────────────────────────────────────────
+
+    def give(self, *, group_id: str, from_id: str, to_id: str, card_id: str, now: str) -> bool:
+        """把一份卡从 from 手里移到 to 手里。from 没有这张卡时什么也不做，返回 False。"""
+        with self._connect() as conn:
+            if not _take(conn, group_id, from_id, card_id):
+                return False
+            _give(conn, group_id, to_id, card_id, now)
+        return True
+
+    def offer(
+        self,
+        *,
+        group_id: str,
+        from_id: str,
+        from_name: str,
+        to_id: str,
+        give_card: str,
+        want_card: str,
+        now: str,
+    ) -> Offer:
+        """发起一次交换。同一对人之间只保留最新的一份。"""
+        offer = Offer(
+            offer_id=uuid.uuid4().hex,
+            group_id=group_id,
+            from_id=from_id,
+            from_name=from_name,
+            to_id=to_id,
+            give_card=give_card,
+            want_card=want_card,
+            created_at=now,
+        )
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM offers WHERE group_id = ? AND from_id = ? AND to_id = ?",
+                (group_id, from_id, to_id),
+            )
+            conn.execute(
+                "INSERT INTO offers VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    offer.offer_id,
+                    group_id,
+                    from_id,
+                    from_name,
+                    to_id,
+                    give_card,
+                    want_card,
+                    now,
+                ),
+            )
+        return offer
+
+    def pending_offer(
+        self, group_id: str, to_id: str, *, now: datetime, ttl: timedelta
+    ) -> Offer | None:
+        """别人发给我的、还没过期的最新一份交换。"""
+        horizon = (now - ttl).isoformat()
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT * FROM offers WHERE group_id = ? AND to_id = ? AND created_at >= ?
+                ORDER BY created_at DESC LIMIT 1""",
+                (group_id, to_id, horizon),
+            ).fetchone()
+        return Offer(**dict(row)) if row else None
+
+    def close_offer(self, offer_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM offers WHERE offer_id = ?", (offer_id,))
+
+    def swap(self, offer: Offer, now: str) -> bool:
+        """成交：双方各交出一份、各收到一份。任何一方已经没有那张卡就整笔作废。"""
+        try:
+            with self._connect() as conn:
+                # 任何一边拿不出卡都抛 _Abort，让整个事务回滚，谁也不少一张。
+                if not _take(conn, offer.group_id, offer.from_id, offer.give_card):
+                    raise _Abort()
+                if not _take(conn, offer.group_id, offer.to_id, offer.want_card):
+                    raise _Abort()
+                _give(conn, offer.group_id, offer.to_id, offer.give_card, now)
+                _give(conn, offer.group_id, offer.from_id, offer.want_card, now)
+                conn.execute("DELETE FROM offers WHERE offer_id = ?", (offer.offer_id,))
+        except _Abort:
+            self.close_offer(offer.offer_id)
+            return False
+        return True
+
+    def star_up(self, *, group_id: str, owner_id: str, card_id: str, note: str) -> int:
+        """消耗一份重复卡升一星并记下她追加的那句话，返回新的星级；条件不满足返回 0。"""
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT copies, stars, notes FROM owned
+                WHERE group_id = ? AND owner_id = ? AND card_id = ?""",
+                (group_id, owner_id, card_id),
+            ).fetchone()
+            if row is None or int(row["copies"]) < 2 or int(row["stars"]) >= MAX_STARS:
+                return 0
+            notes = [*_json_list(row["notes"]), note]
+            stars = int(row["stars"]) + 1
+            conn.execute(
+                """UPDATE owned SET copies = copies - 1, stars = ?, notes = ?
+                WHERE group_id = ? AND owner_id = ? AND card_id = ?""",
+                (stars, json.dumps(notes, ensure_ascii=False), group_id, owner_id, card_id),
+            )
+        return stars
+
+
+class _Abort(Exception):
+    pass
+
+
+def _take(conn: sqlite3.Connection, group_id: str, owner_id: str, card_id: str) -> bool:
+    row = conn.execute(
+        "SELECT copies FROM owned WHERE group_id = ? AND owner_id = ? AND card_id = ?",
+        (group_id, owner_id, card_id),
+    ).fetchone()
+    if row is None or int(row[0]) < 1:
+        return False
+    if int(row[0]) == 1:
+        conn.execute(
+            "DELETE FROM owned WHERE group_id = ? AND owner_id = ? AND card_id = ?",
+            (group_id, owner_id, card_id),
+        )
+    else:
+        conn.execute(
+            """UPDATE owned SET copies = copies - 1
+            WHERE group_id = ? AND owner_id = ? AND card_id = ?""",
+            (group_id, owner_id, card_id),
+        )
+    return True
+
+
+def _give(conn: sqlite3.Connection, group_id: str, owner_id: str, card_id: str, now: str) -> None:
+    conn.execute(
+        """INSERT INTO owned (group_id, owner_id, card_id, copies, first_at)
+        VALUES (?, ?, ?, 1, ?)
+        ON CONFLICT (group_id, owner_id, card_id) DO UPDATE SET copies = copies + 1""",
+        (group_id, owner_id, card_id, now),
+    )
