@@ -8,6 +8,7 @@ from __future__ import annotations
 import io
 import os
 import random
+import re
 from functools import lru_cache
 from importlib.resources import files
 from pathlib import Path
@@ -58,6 +59,37 @@ def _font(size: int, bold: bool = False, cute: bool = False) -> ImageFont.FreeTy
         if path.is_file():
             return ImageFont.truetype(str(path), size)
     raise OSError("缺少中文字体，请安装 Noto Sans CJK。")
+
+
+# 不可见的双向控制符/零宽字符：群昵称里带进来时，字体会画成方框或空白。
+_INVISIBLE_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff\u00ad]")
+
+
+def _clean_text(text: object) -> str:
+    return _INVISIBLE_RE.sub("", str(text or ""))
+
+
+def _glyph_supported(font: ImageFont.FreeTypeFont, char: str) -> bool:
+    """字体缺字时会画 .notdef 方框；用私用区字符的掩码当基准判断。"""
+    if char.isspace():
+        return True
+    try:
+        missing = Image.Image()._new(font.getmask("\ue000"))
+        current = Image.Image()._new(font.getmask(char))
+    except Exception:
+        return True
+    return not (current.size == missing.size and current.tobytes() == missing.tobytes())
+
+
+def _font_for(
+    text: str, size: int, bold: bool = False, cute: bool = False
+) -> ImageFont.FreeTypeFont:
+    """可爱字体缺字（假名、生僻字）时退回完整中文字体，避免方框。"""
+    if cute:
+        candidate = _font(size, bold=bold, cute=True)
+        if all(_glyph_supported(candidate, ch) for ch in text):
+            return candidate
+    return _font(size, bold=bold, cute=False)
 
 
 def _wrap(
@@ -114,8 +146,8 @@ def _avatar(avatar: bytes | None, name: str, size: int) -> Image.Image:
         # 没有头像时画名字的第一个字，像一枚月亮上的印章。
         face = Image.new("RGB", (size, size), (64, 78, 128))
         draw = ImageDraw.Draw(face)
-        initial = (name or "?")[0]
-        font = _font(size // 2, cute=True)
+        initial = _clean_text(name)[:1] or "?"
+        font = _font_for(initial, size // 2, cute=True)
         box = draw.textbbox((0, 0), initial, font=font)
         draw.text(
             ((size - (box[2] - box[0])) / 2 - box[0], (size - (box[3] - box[1])) / 2 - box[1]),
@@ -155,13 +187,16 @@ def render_card(
     """一张收藏卡（600 宽）。升过星的卡会多出她写给收藏者的话，卡也跟着变长。"""
     rarity_color = RARITY_COLORS.get(card.rarity, RARITY_COLORS["R"])
     measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-    note_font = _font(21, cute=True)
-    note_lines = _wrap(measure, f"—— {persona_name}：{card.note}", note_font, CARD_W - 120)[:3]
+    subject_name = _clean_text(card.subject_name)
+    note_texts = [f"—— {_clean_text(persona_name)}：{_clean_text(card.note)}"]
+    note_texts += [f"悄悄话：{_clean_text(note)}" for note in (extra_notes or [])]
+    note_font = _font_for("".join(note_texts), 21, cute=True)
+    note_lines = _wrap(measure, note_texts[0], note_font, CARD_W - 120)[:3]
     extra_lines = [
         line
-        for note in (extra_notes or [])
         # 可爱字体里没有 ✦ 这类符号，前缀只用汉字。
-        for line in _wrap(measure, f"悄悄话：{note}", note_font, CARD_W - 120)[:2]
+        for text in note_texts[1:]
+        for line in _wrap(measure, text, note_font, CARD_W - 120)[:2]
     ]
     # 插画卡的主图更高一些，卡面整体跟着变长。
     lift = _ART_LIFT if art else 0
@@ -237,10 +272,15 @@ def render_card(
     # 技能
     skill_top = y + 14
     skill_font = _font(21)
-    skill_lines = _wrap(draw, card.skill_text, skill_font, CARD_W - 140)[:3]
+    skill_lines = _wrap(draw, _clean_text(card.skill_text), skill_font, CARD_W - 140)[:3]
     skill_bottom = skill_top + 48 + 30 * len(skill_lines)
     draw.rounded_rectangle([48, skill_top, CARD_W - 48, skill_bottom], radius=16, fill=_PANEL)
-    draw.text((70, skill_top + 12), f"技能【{card.skill_name}】", font=_font(23, bold=True), fill=_GOLD)
+    draw.text(
+        (70, skill_top + 12),
+        f"技能【{_clean_text(card.skill_name)}】",
+        font=_font(23, bold=True),
+        fill=_GOLD,
+    )
     for index, line in enumerate(skill_lines):
         draw.text((70, skill_top + 46 + 30 * index), line, font=skill_font, fill=_SILVER)
 
@@ -255,7 +295,7 @@ def render_card(
     if painting is not None:
         base.alpha_composite(painting, (40, top - 4))
     else:
-        base.alpha_composite(_avatar(avatar, card.subject_name, size), (cx - size // 2, top))
+        base.alpha_composite(_avatar(avatar, subject_name, size), (cx - size // 2, top))
     out = io.BytesIO()
     base.convert("RGB").save(out, format="PNG", optimize=True)
     return out.getvalue()
@@ -263,8 +303,9 @@ def render_card(
 
 def _member_body(draw: ImageDraw.ImageDraw, card: Card, rarity_color, *, dy: int = 0) -> int:
     """人物卡：名字、称号、五项属性。返回下一块的起点。"""
-    _centered(draw, 360 + dy, card.subject_name[:14], _font(36, bold=True), _SILVER)
-    _centered(draw, 410 + dy, f"「{card.title}」", _font(30, cute=True), _GOLD)
+    title_text = f"「{_clean_text(card.title)}」"
+    _centered(draw, 360 + dy, _clean_text(card.subject_name)[:14], _font(36, bold=True), _SILVER)
+    _centered(draw, 410 + dy, title_text, _font_for(title_text, 30, cute=True), _GOLD)
     y = 470 + dy
     label_font, value_font = _font(21), _font(21, bold=True)
     for key in STAT_KEYS:
@@ -290,19 +331,21 @@ def _member_body(draw: ImageDraw.ImageDraw, card: Card, rarity_color, *, dy: int
 
 def _moment_body(draw: ImageDraw.ImageDraw, card: Card, rarity_color, *, dy: int = 0) -> int:
     """名场面：名字、那句原话和说话的人、出演名单。返回下一块的起点。"""
-    _centered(draw, 284 + dy, f"「{card.title}」", _font(34, cute=True), _GOLD)
+    title_text = f"「{_clean_text(card.title)}」"
+    _centered(draw, 284 + dy, title_text, _font_for(title_text, 34, cute=True), _GOLD)
     quote_font = _font(25, bold=True)
-    quote_lines = _wrap(draw, f"“{card.quote}”", quote_font, CARD_W - 130)[:4]
+    quote_lines = _wrap(draw, f"“{_clean_text(card.quote)}”", quote_font, CARD_W - 130)[:4]
     y = 344 + dy
     for line in quote_lines:
         _centered(draw, y, line, quote_font, _SILVER)
         y += 36
-    who = f"—— {card.subject_name}"
+    who = f"—— {_clean_text(card.subject_name)}"
     font = _font(20)
     draw.text((CARD_W - 70 - draw.textlength(who, font=font), y + 4), who, font=font, fill=_SOFT)
     y += 44
     cast_font = _font(19)
-    for line in _wrap(draw, "出演：" + "、".join(card.cast_names), cast_font, CARD_W - 130)[:2]:
+    cast_text = "出演：" + "、".join(_clean_text(name) for name in card.cast_names)
+    for line in _wrap(draw, cast_text, cast_font, CARD_W - 130)[:2]:
         draw.text((64, y), line, font=cast_font, fill=rarity_color)
         y += 28
     return max(y, 560 + dy)
@@ -323,11 +366,13 @@ def render_collection(
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
-    draw.text((_GAP + 8, 30), f"{owner_name[:12]}的图鉴", font=_font(36, bold=True), fill=_SILVER)
+    owner = _clean_text(owner_name)
+    persona = _clean_text(persona_name)
+    draw.text((_GAP + 8, 30), f"{owner[:12]}的图鉴", font=_font(36, bold=True), fill=_SILVER)
     progress = f"已收集 {len(have)}/{len(pool)}"
     draw.text((_GAP + 10, 86), progress, font=_font(22), fill=_GOLD)
-    sign = f"—— {persona_name}画的卡"
-    small = _font(19, cute=True)
+    sign = f"—— {persona}画的卡"
+    small = _font_for(sign, 19, cute=True)
     draw.text(
         (width - _GAP - 8 - draw.textlength(sign, font=small), 92), sign, font=small, fill=_FAINT
     )
@@ -356,9 +401,20 @@ def render_collection(
                     font=font,
                     fill=_GOLD,
                 )
-            draw.text((x + 14, y + 38), card.name[:8], font=_font(24, bold=True), fill=_SILVER)
+            draw.text(
+                (x + 14, y + 38),
+                _clean_text(card.name)[:8],
+                font=_font(24, bold=True),
+                fill=_SILVER,
+            )
             subtitle = card.subject_name if card.kind == KIND_MOMENT else card.title
-            draw.text((x + 14, y + 74), subtitle[:10], font=_font(18, cute=True), fill=_GOLD)
+            subtitle_text = _clean_text(subtitle)[:10]
+            draw.text(
+                (x + 14, y + 74),
+                subtitle_text,
+                font=_font_for(subtitle_text, 18, cute=True),
+                fill=_GOLD,
+            )
             if item.copies > 1:
                 mark = f"×{item.copies}"
                 font = _font(18, bold=True)
