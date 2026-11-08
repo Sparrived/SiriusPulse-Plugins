@@ -15,9 +15,11 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from .members import STAT_KEYS
-from .store import KIND_MOMENT, KIND_MOOD, MAX_STARS, Card, Owned
+from .store import KIND_AWAKENED, KIND_MOMENT, KIND_MOOD, MAX_STARS, Card, Owned
 
 CARD_W, CARD_H = 600, 900
+#: 插画卡比普通卡高出的部分，全部给主图。
+_ART_LIFT = 120
 
 _NIGHT_TOP = (22, 30, 56)
 _NIGHT_BOTTOM = (46, 58, 99)
@@ -134,6 +136,9 @@ def _version(card: Card) -> str:
     stamp = card.minted_at[:10].replace("-", ".") if card.minted_at else ""
     if card.kind == KIND_MOMENT:
         return f"名场面 · {stamp}" if stamp else "名场面"
+    if card.kind == KIND_AWAKENED:
+        owner = card.cast_names[0] if card.cast_names else ""
+        return f"觉醒 · 专属给{owner[:8]}" if owner else "觉醒"
     label = "心情卡" if card.kind == KIND_MOOD else "初版"
     return f"{label} · {stamp[:7]}" if stamp else label
 
@@ -145,6 +150,7 @@ def render_card(
     persona_name: str,
     stars: int = 1,
     extra_notes: list[str] | None = None,
+    art: bytes | None = None,
 ) -> bytes:
     """一张收藏卡（600 宽）。升过星的卡会多出她写给收藏者的话，卡也跟着变长。"""
     rarity_color = RARITY_COLORS.get(card.rarity, RARITY_COLORS["R"])
@@ -157,7 +163,9 @@ def render_card(
         # 可爱字体里没有 ✦ 这类符号，前缀只用汉字。
         for line in _wrap(measure, f"悄悄话：{note}", note_font, CARD_W - 120)[:2]
     ]
-    height = CARD_H + 30 * len(extra_lines)
+    # 插画卡的主图更高一些，卡面整体跟着变长。
+    lift = _ART_LIFT if art else 0
+    height = CARD_H + 30 * len(extra_lines) + lift
 
     base = _night((CARD_W, height), card.card_id).convert("RGBA")
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
@@ -187,25 +195,44 @@ def render_card(
     )
     draw.text((CARD_W - 44 - badge_w + 14, 40), card.rarity, font=badge, fill=_NIGHT_TOP)
     _centered(draw, 44, _version(card), small, _FAINT)
-    if card.supply:
+    if card.supply and card.kind != KIND_AWAKENED:
         _centered(draw, 70, f"限量 {card.issued}/{card.supply}", _font(17), rarity_color)
 
     size = 160 if card.kind == KIND_MOMENT else 240
     cx, top = CARD_W // 2, 100 if card.kind == KIND_MOMENT else 96
+    painting = _art_panel(art, size=(CARD_W - 80, size + 6 + lift)) if art else None
     glow = Image.new("RGBA", base.size, (0, 0, 0, 0))
-    ImageDraw.Draw(glow).ellipse(
-        [cx - size // 2 - 18, top - 18, cx + size // 2 + 18, top + size + 18],
-        fill=(*rarity_color, 120),
-    )
+    if painting is not None:
+        # 插画卡：头像换成她画的那张图，四周一圈稀有度的光。
+        ImageDraw.Draw(glow).rounded_rectangle(
+            [32, top - 12, CARD_W - 32, top + painting.height + 8],
+            radius=22,
+            fill=(*rarity_color, 150),
+        )
+    else:
+        ImageDraw.Draw(glow).ellipse(
+            [cx - size // 2 - 18, top - 18, cx + size // 2 + 18, top + size + 18],
+            fill=(*rarity_color, 120),
+        )
     base = Image.alpha_composite(base, glow.filter(ImageFilter.GaussianBlur(16)))
-    draw.ellipse(
-        [cx - size // 2 - 5, top - 5, cx + size // 2 + 5, top + size + 5], outline=_SILVER, width=3
-    )
+    if painting is not None:
+        draw.rounded_rectangle(
+            [38, top - 6, CARD_W - 38, top + painting.height + 2],
+            radius=18,
+            outline=_SILVER,
+            width=3,
+        )
+    else:
+        draw.ellipse(
+            [cx - size // 2 - 5, top - 5, cx + size // 2 + 5, top + size + 5],
+            outline=_SILVER,
+            width=3,
+        )
 
     if card.kind == KIND_MOMENT:
-        y = _moment_body(draw, card, rarity_color)
+        y = _moment_body(draw, card, rarity_color, dy=lift if painting is not None else 0)
     else:
-        y = _member_body(draw, card, rarity_color)
+        y = _member_body(draw, card, rarity_color, dy=lift if painting is not None else 0)
 
     # 技能
     skill_top = y + 14
@@ -225,17 +252,20 @@ def render_card(
         draw.text((60, note_top + 30 * (len(note_lines) + index)), line, font=note_font, fill=_GOLD)
 
     base = Image.alpha_composite(base, overlay)
-    base.alpha_composite(_avatar(avatar, card.subject_name, size), (cx - size // 2, top))
+    if painting is not None:
+        base.alpha_composite(painting, (40, top - 4))
+    else:
+        base.alpha_composite(_avatar(avatar, card.subject_name, size), (cx - size // 2, top))
     out = io.BytesIO()
     base.convert("RGB").save(out, format="PNG", optimize=True)
     return out.getvalue()
 
 
-def _member_body(draw: ImageDraw.ImageDraw, card: Card, rarity_color) -> int:
+def _member_body(draw: ImageDraw.ImageDraw, card: Card, rarity_color, *, dy: int = 0) -> int:
     """人物卡：名字、称号、五项属性。返回下一块的起点。"""
-    _centered(draw, 360, card.subject_name[:14], _font(36, bold=True), _SILVER)
-    _centered(draw, 410, f"「{card.title}」", _font(30, cute=True), _GOLD)
-    y = 470
+    _centered(draw, 360 + dy, card.subject_name[:14], _font(36, bold=True), _SILVER)
+    _centered(draw, 410 + dy, f"「{card.title}」", _font(30, cute=True), _GOLD)
+    y = 470 + dy
     label_font, value_font = _font(21), _font(21, bold=True)
     for key in STAT_KEYS:
         value = card.stats.get(key)
@@ -258,12 +288,12 @@ def _member_body(draw: ImageDraw.ImageDraw, card: Card, rarity_color) -> int:
     return y
 
 
-def _moment_body(draw: ImageDraw.ImageDraw, card: Card, rarity_color) -> int:
+def _moment_body(draw: ImageDraw.ImageDraw, card: Card, rarity_color, *, dy: int = 0) -> int:
     """名场面：名字、那句原话和说话的人、出演名单。返回下一块的起点。"""
-    _centered(draw, 284, f"「{card.title}」", _font(34, cute=True), _GOLD)
+    _centered(draw, 284 + dy, f"「{card.title}」", _font(34, cute=True), _GOLD)
     quote_font = _font(25, bold=True)
     quote_lines = _wrap(draw, f"“{card.quote}”", quote_font, CARD_W - 130)[:4]
-    y = 344
+    y = 344 + dy
     for line in quote_lines:
         _centered(draw, y, line, quote_font, _SILVER)
         y += 36
@@ -275,7 +305,7 @@ def _moment_body(draw: ImageDraw.ImageDraw, card: Card, rarity_color) -> int:
     for line in _wrap(draw, "出演：" + "、".join(card.cast_names), cast_font, CARD_W - 130)[:2]:
         draw.text((64, y), line, font=cast_font, fill=rarity_color)
         y += 28
-    return max(y, 560)
+    return max(y, 560 + dy)
 
 
 _CELL_W, _CELL_H, _GAP, _COLS = 220, 132, 16, 4
@@ -363,3 +393,26 @@ def _centered_in(
     draw: ImageDraw.ImageDraw, x: int, y: int, width: int, text: str, font, fill
 ) -> None:
     draw.text((x + (width - draw.textlength(text, font=font)) / 2, y), text, font=font, fill=fill)
+
+
+def _art_panel(art: bytes, *, size: tuple[int, int]) -> Image.Image | None:
+    """把插画裁成卡面主图的尺寸（居中裁切），圆角。读不了就当没有插画。"""
+    width, height = size
+    try:
+        with Image.open(io.BytesIO(art)) as loaded:
+            image = loaded.convert("RGB")
+    except Exception:
+        return None
+    scale = max(width / image.width, height / image.height)
+    resized = image.resize(
+        (max(width, round(image.width * scale)), max(height, round(image.height * scale))),
+        Image.Resampling.LANCZOS,
+    )
+    left = (resized.width - width) // 2
+    top = (resized.height - height) // 2
+    cropped = resized.crop((left, top, left + width, top + height))
+    mask = Image.new("L", size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, width - 1, height - 1], radius=16, fill=255)
+    panel = Image.new("RGBA", size, (0, 0, 0, 0))
+    panel.paste(cropped, (0, 0), mask)
+    return panel

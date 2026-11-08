@@ -9,7 +9,10 @@
 
 - ``member``：每人一张的常驻卡（R）；
 - ``mood``：她心情好时给某人画的变体（SR）；
-- ``moment``：群里的名场面（UR），引用一句原话，限量发行。
+- ``moment``：群里的名场面（UR），引用一句原话，限量发行；
+- ``awakened``：三星卡觉醒出的超级卡（SSR），她专门为收藏者画了一张插画，只此一份。
+
+名场面和觉醒卡的插画由后台的画图任务（``art_jobs``）慢慢画，画好再挂到卡上。
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from typing import Any, Iterator
 KIND_MEMBER = "member"
 KIND_MOOD = "mood"
 KIND_MOMENT = "moment"
+KIND_AWAKENED = "awakened"
 
 MAX_STARS = 3
 
@@ -80,6 +84,18 @@ CREATE TABLE IF NOT EXISTS opted_out (
     PRIMARY KEY (group_id, subject_id)
 );
 
+CREATE TABLE IF NOT EXISTS art_jobs (
+    job_id     TEXT PRIMARY KEY,
+    group_id   TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    card_id    TEXT NOT NULL,
+    owner_id   TEXT NOT NULL DEFAULT '',
+    owner_name TEXT NOT NULL DEFAULT '',
+    status     TEXT NOT NULL DEFAULT 'pending',
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS offers (
     offer_id   TEXT PRIMARY KEY,
     group_id   TEXT NOT NULL,
@@ -101,6 +117,8 @@ _ADDED_COLUMNS = {
         "cast_names": "TEXT NOT NULL DEFAULT '[]'",
         "supply": "INTEGER NOT NULL DEFAULT 0",
         "issued": "INTEGER NOT NULL DEFAULT 0",
+        "art": "TEXT NOT NULL DEFAULT ''",
+        "base_card": "TEXT NOT NULL DEFAULT ''",
     },
     "owned": {
         "stars": "INTEGER NOT NULL DEFAULT 1",
@@ -142,6 +160,10 @@ class Card:
     cast_names: list[str] = field(default_factory=list)
     supply: int = 0
     issued: int = 0
+    #: 插画文件名（在 ``artifacts/gacha/art/`` 下），没有插画是空串。
+    art: str = ""
+    #: 觉醒卡是从哪张卡觉醒来的。
+    base_card: str = ""
 
     @property
     def label(self) -> str:
@@ -185,6 +207,8 @@ class Card:
             cast_names=_json_list(row["cast_names"]),
             supply=int(row["supply"]),
             issued=int(row["issued"]),
+            art=row["art"],
+            base_card=row["base_card"],
         )
 
 
@@ -267,6 +291,8 @@ class GachaStore:
         cast_ids: list[str] | None = None,
         cast_names: list[str] | None = None,
         supply: int = 0,
+        issued: int = 0,
+        base_card: str = "",
     ) -> Card:
         with self._connect() as conn:
             row = conn.execute(
@@ -291,12 +317,14 @@ class GachaStore:
                 cast_ids=list(cast_ids or []),
                 cast_names=list(cast_names or []),
                 supply=supply,
+                issued=issued,
+                base_card=base_card,
             )
             conn.execute(
                 """INSERT INTO cards (card_id, group_id, no, subject_id, subject_name,
                     subject_uid, rarity, title, skill_name, skill_text, note, stats, minted_at,
-                    kind, quote, cast_ids, cast_names, supply, issued)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)""",
+                    kind, quote, cast_ids, cast_names, supply, issued, art, base_card)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?)""",
                 (
                     card.card_id,
                     card.group_id,
@@ -316,9 +344,89 @@ class GachaStore:
                     json.dumps(card.cast_ids, ensure_ascii=False),
                     json.dumps(card.cast_names, ensure_ascii=False),
                     card.supply,
+                    card.issued,
+                    card.base_card,
                 ),
             )
         return card
+
+    def visible_cards(self, group_id: str, viewer_id: str) -> list[Card]:
+        """某人在图鉴里看得到的卡：别人专属的觉醒卡不算进他的收集目标。"""
+        mine = {item.card.card_id for item in self.collection(group_id, viewer_id)}
+        return [
+            card
+            for card in self.cards(group_id)
+            if card.kind != KIND_AWAKENED or card.card_id in mine
+        ]
+
+    def awakened_from(self, group_id: str, owner_id: str, base_card: str) -> Card | None:
+        """这个人从这张卡觉醒出来的那张（还在他手里的话）。"""
+        for item in self.collection(group_id, owner_id):
+            if item.card.kind == KIND_AWAKENED and item.card.base_card == base_card:
+                return item.card
+        return None
+
+    def set_art(self, card_id: str, name: str) -> None:
+        with self._connect() as conn:
+            conn.execute("UPDATE cards SET art = ? WHERE card_id = ?", (name, card_id))
+
+    def grant(self, *, group_id: str, owner_id: str, card_id: str, now: str) -> None:
+        """直接把一份卡放进某人的收藏（觉醒卡生来就是他的）。"""
+        with self._connect() as conn:
+            _give(conn, group_id, owner_id, card_id, now)
+
+    # ── 画图任务 ──────────────────────────────────────────────────────
+
+    def add_art_job(
+        self,
+        *,
+        group_id: str,
+        kind: str,
+        card_id: str,
+        now: str,
+        owner_id: str = "",
+        owner_name: str = "",
+    ) -> str:
+        job_id = uuid.uuid4().hex
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO art_jobs (job_id, group_id, kind, card_id, owner_id, owner_name,
+                    status, attempts, created_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?)""",
+                (job_id, group_id, kind, card_id, owner_id, owner_name, now),
+            )
+        return job_id
+
+    def pending_art_job(self, group_id: str, owner_id: str, card_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT 1 FROM art_jobs WHERE group_id = ? AND owner_id = ? AND card_id = ?
+                AND status = 'pending'""",
+                (group_id, owner_id, card_id),
+            ).fetchone()
+        return row is not None
+
+    def next_art_job(self) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM art_jobs WHERE status = 'pending' ORDER BY created_at LIMIT 1"
+            ).fetchone()
+        return dict(row) if row else None
+
+    def art_job_tried(self, job_id: str, *, status: str = "pending") -> int:
+        """记一次尝试并更新状态，返回累计尝试次数。"""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE art_jobs SET attempts = attempts + 1, status = ? WHERE job_id = ?",
+                (status, job_id),
+            )
+            row = conn.execute(
+                "SELECT attempts FROM art_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def finish_art_job(self, job_id: str, status: str) -> None:
+        with self._connect() as conn:
+            conn.execute("UPDATE art_jobs SET status = ? WHERE job_id = ?", (status, job_id))
 
     def cards(self, group_id: str) -> list[Card]:
         with self._connect() as conn:

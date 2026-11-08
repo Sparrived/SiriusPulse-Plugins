@@ -64,22 +64,38 @@ def card_reply(title="凌晨三点的哲学家") -> str:
     )
 
 
+def _png(color=(60, 70, 120)) -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", (64, 96), color).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
 class Engine:
-    """只提供图鉴要读的那几样：语义画像、认知事件、聊天归档、人设和模型。"""
+    """只提供图鉴要读的那几样：语义画像、认知事件、聊天归档、她说话的链路和画笔。"""
 
     def __init__(self, work_path: Path) -> None:
         self.work_path = work_path
         self.basic_store = BasicMemoryFileStore(work_path)
         self.persona = SimpleNamespace(name="月白", full_system_prompt="你是月白。")
-        self.model_router = None
-        self.token_store = None
         self.prompts: list[str] = []
-        self.replies: list[str] = []  # 写卡、判断名场面（JSON）
-        self.lines: list[str] = []  # 她说的一句话（抽到好卡的反应、升星）
+        self.tasks: list[str] = []
+        self.replies: list[str] = []  # 写卡、判断名场面、觉醒（JSON）
+        self.lines: list[str] = []  # 她说的一句话（抽到好卡的反应、升星、插画画面）
+        self.script = ""  # 她写的台词本
         self.events: list[tuple[str, str, float, float]] = []
+        self.paintings: list = []  # 生图请求
+        self.paint_error: Exception | None = None
+        self.announced: list[dict] = []  # 她主动发到群里的话
         self.semantic_memory = SimpleNamespace(list_group_user_profiles=self._profiles)
         self.cognition_store = SimpleNamespace(execute=self._events)
-        self.provider_async = SimpleNamespace(generate_async=self._generate)
+        assets = work_path / "assets"
+        assets.mkdir(parents=True, exist_ok=True)
+        (assets / "turnaround.png").write_bytes(_png((200, 200, 230)))
+        self.brain = SimpleNamespace(
+            generate_text=self._generate,
+            generate_image_async=self._paint,
+            persona_assets_dir=assets,
+        )
         self.assistant_emotion = SimpleNamespace(valence=0.2)
 
     def _profiles(self, group_id):
@@ -100,12 +116,27 @@ class Engine:
         rows = [(u, ts, v) for g, u, ts, v in self.events if g == params[0]]
         return SimpleNamespace(fetchall=lambda: rows)
 
-    async def _generate(self, request, return_reasoning=False):
-        self.prompts.append("\n".join(str(m["content"]) for m in request.messages))
-        if request.response_format is None:
-            return SimpleNamespace(content=self.lines.pop(0) if self.lines else "")
-        reply = self.replies.pop(0) if self.replies else card_reply()
-        return SimpleNamespace(content=reply)
+    async def _generate(self, *, system_prompt, messages, group_id, task_name, **_):
+        """她的对话生成链路（真实环境里由 Brain 注入完整人设）。"""
+        self.prompts.append("\n".join([system_prompt, *(str(m["content"]) for m in messages)]))
+        self.tasks.append(task_name)
+        if "【写你的台词本】" in system_prompt:
+            return self.script
+        if "只输出一个 JSON" in system_prompt:
+            return self.replies.pop(0) if self.replies else card_reply()
+        return self.lines.pop(0) if self.lines else ""
+
+    async def _paint(self, request):
+        from sirius_pulse.providers.base import ImageGenerationResult
+
+        self.paintings.append(request)
+        if self.paint_error is not None:
+            raise self.paint_error
+        return ImageGenerationResult(image_bytes=_png(), mime_type="image/png")
+
+    async def dispatch_proactive_message(self, *, group_id, text, image_path="", **_):
+        self.announced.append({"group_id": group_id, "text": text, "image_path": image_path})
+        return True
 
     def get_active_groups(self):
         return [GROUP, "private_10001"]
@@ -279,7 +310,9 @@ async def test_first_draw_paints_the_most_active_member_from_this_group_only(cha
     prompt = chat.engine.prompts[0]
     assert "阿明" in prompt and "明天一定早睡" in prompt
     assert "跳槽" not in prompt and "怕黑" not in prompt and "/抽卡" not in prompt
-    assert "月白" in prompt, "卡面要用她的口气写"
+    # 卡面走她平时说话的那条生成链路：人设、说话方式由宿主注入，和聊天时一样。
+    assert chat.engine.tasks == ["plugin_generate"]
+    assert "用你自己平时说话的方式" in prompt
     # 回复里既有她的台词也有卡面，台词随图一起真正发到群里。
     assert "阿明" in chat.said() and "凌晨三点的哲学家" in chat.said()
     [card] = chat.images()
@@ -372,7 +405,7 @@ async def test_opting_out_tears_up_the_card_everywhere_and_she_stops_painting(ch
     assert "阿明" in chat.said()
 
     await chat.send("/我的卡 退出", user="u-ming")
-    assert "撕掉" in chat.said()
+    assert "不画你" in chat.said()
     await chat.send("/图鉴", user="u-hong")
     assert "这个群的图鉴还是空的" in chat.said()
 
@@ -566,7 +599,7 @@ async def test_in_a_good_mood_she_paints_a_mood_card_once_a_day_and_luck_goes_up
     chat.rng = _Always()
     chat.engine.lines = ["你抽到了我心情最好的那张！"]
     await chat.send("/抽卡", user="u-hong")
-    assert "心情卡" in chat.said() and "心情最好的那张" in chat.said()
+    assert chat.said().startswith("你抽到了我心情最好的那张"), "SR 以上她现场说，不用模板"
     assert "心情好，手气" not in chat.said()
 
 
@@ -631,6 +664,13 @@ async def test_a_highlight_becomes_a_limited_ur_card_quoting_what_was_really_sai
     await plugin.mint_beat()
     assert _judged(chat) == 1, "一个群一天只判断一次"
 
+    # 名场面卡排队配插画：她先写画面，再画，画好在群里说一声。
+    chat.engine.lines = ["一口冒着热气的大火锅摆在群聊气泡做的桌子上，月白举着漏勺在旁边"]
+    assert await plugin.art_beat() is True
+    assert "大火锅" in chat.engine.paintings[0].prompt
+    [news] = chat.engine.announced
+    assert "火锅店开业事件" in news["text"] and news["image_path"]
+
     # 出演的人退出图鉴：名场面也一起撕掉。
     await chat.send("/我的卡 退出", user="u-hong")
     await chat.send("/图鉴", user="u-new")
@@ -652,6 +692,147 @@ async def test_a_dull_stretch_is_not_a_highlight_and_is_judged_again_tomorrow(ch
     chat.clock[0] = _cn(2, 9)  # 第二天，那段聊天仍在 24 小时内
     await plugin.mint_beat()
     assert _judged(chat) == 2
+
+
+# --- 她的台词本 -----------------------------------------------------------------
+
+
+def script_reply(**lines) -> str:
+    return json.dumps(lines, ensure_ascii=False)
+
+
+def _scripts(chat) -> int:
+    return sum("【写你的台词本】" in prompt for prompt in chat.engine.prompts)
+
+
+@pytest.mark.asyncio
+async def test_everyday_lines_come_from_the_script_she_writes_each_week(chat):
+    chat.engine.script = script_reply(
+        draw_new=["诶嘿，{name}来啦——「{title}」！", "这句少了占位符"],
+        drawn_today=["{nope}今天不行"],
+    )
+    plugin = await _open(chat)  # 她还没写台词本：先用保底句
+    assert "抽到了" in chat.said()
+
+    await plugin.mint_beat()
+    assert _scripts(chat) == 1
+    await chat.send("/抽卡", user="u-wang")
+    assert "诶嘿" in chat.said(), "她写的那句"
+    await chat.send("/抽卡", user="u-wang")
+    assert "今天已经抽过" in chat.said(), "占位符不对的句子被丢掉，退回保底句"
+
+    await plugin.mint_beat()
+    assert _scripts(chat) == 1, "一周只写一本"
+    chat.clock[0] += timedelta(days=8)
+    await plugin.mint_beat()
+    assert _scripts(chat) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_script_she_could_not_write_is_not_retried_the_same_day(chat):
+    chat.engine.script = "台词本？我想想……"
+    plugin = await _open(chat)
+
+    await plugin.mint_beat()
+    await plugin.mint_beat()
+    assert _scripts(chat) == 1
+
+    chat.clock[0] += timedelta(days=1)
+    await plugin.mint_beat()
+    assert _scripts(chat) == 2
+
+
+# --- 超级卡：觉醒与插画 -----------------------------------------------------------
+
+
+def awaken_reply() -> str:
+    return json.dumps(
+        {
+            "title": "月下守夜的哲人",
+            "skill_name": "永夜不眠",
+            "skill_text": "群里每有一个人说晚安，他就多清醒一小时。",
+            "note": "这张是专门画给你的。",
+            "scene": "月光下一只戴眼镜的猫头鹰站在钟楼上，月白坐在旁边陪它看星星",
+        },
+        ensure_ascii=False,
+    )
+
+
+async def _three_stars(chat, plugin, user: str = "u-hong", no: int = 1) -> None:
+    _grant(plugin, user, no, copies=3)
+    chat.engine.lines += ["第一句悄悄话", "第二句悄悄话"]
+    await chat.send(f"/升星 {no}", user=user)
+    await chat.send(f"/升星 {no}", user=user)
+
+
+@pytest.mark.asyncio
+async def test_a_three_star_card_awakens_into_an_ssr_she_paints_just_for_you(chat):
+    plugin = await _three_cards(chat)
+    _grant(plugin, "u-hong", 1)
+    await chat.send("/觉醒 1", user="u-hong")
+    assert "3 星" in chat.said(), "不到三星不能觉醒"
+
+    await _three_stars(chat, plugin)
+    await chat.send("/觉醒 1", user="u-hong")
+    assert "画好叫你" in chat.said()
+    await chat.send("/觉醒 1", user="u-hong")
+    assert "还在画" in chat.said()
+
+    chat.engine.replies = [awaken_reply()]
+    chat.engine.lines = ["小红！你的觉醒卡画好啦！"]
+    assert await plugin.art_beat() is True
+
+    [painting] = chat.engine.paintings
+    assert "猫头鹰" in painting.prompt and "真实人物" in painting.prompt
+    assert [name for name, _ in painting.reference_images] == ["turnaround.png"], "她按自己的形象图画"
+    [news] = chat.engine.announced
+    assert news["group_id"] == GROUP and news["text"] == "小红！你的觉醒卡画好啦！"
+    with Image.open(news["image_path"]) as image:
+        assert image.height > 900, "插画卡比普通卡高"
+
+    await chat.send("/图鉴", user="u-hong")
+    assert "已收集 2/4" in chat.said()
+    await chat.send("/图鉴", user="u-wang")
+    assert "/3" in chat.said(), "别人的专属觉醒卡不算进我的收集目标"
+    await chat.send("/送卡 老王 4", user="u-hong")
+    assert "不能送人" in chat.said()
+    await chat.send("/觉醒 1", user="u-hong")
+    assert "已经觉醒过" in chat.said()
+
+
+@pytest.mark.asyncio
+async def test_a_painting_that_keeps_failing_is_dropped_and_she_says_so(chat):
+    plugin = await _three_cards(chat)
+    await _three_stars(chat, plugin)
+    await chat.send("/觉醒 1", user="u-hong")
+    chat.engine.paint_error = RuntimeError("upstream")
+    chat.engine.replies = [awaken_reply(), awaken_reply()]
+
+    assert await plugin.art_beat() is False
+    assert await plugin.art_beat() is False
+
+    [news] = chat.engine.announced
+    assert "没画好" in news["text"] and not news["image_path"]
+    await chat.send("/图鉴", user="u-hong")
+    assert "已收集 1/3" in chat.said(), "画失败不会凭空多出一张卡"
+    assert await plugin.art_beat() is False and len(chat.engine.paintings) == 2, "不再重画"
+
+
+@pytest.mark.asyncio
+async def test_her_daily_painting_budget_makes_the_rest_wait_until_tomorrow(chat):
+    plugin = await _three_cards(chat)
+    plugin.ctx.config["art_per_day"] = 1
+    await _three_stars(chat, plugin, user="u-hong", no=1)
+    await _three_stars(chat, plugin, user="u-wang", no=2)
+    await chat.send("/觉醒 1", user="u-hong")
+    await chat.send("/觉醒 2", user="u-wang")
+    chat.engine.replies = [awaken_reply(), awaken_reply()]
+
+    assert await plugin.art_beat() is True
+    assert await plugin.art_beat() is False and len(chat.engine.paintings) == 1
+
+    chat.clock[0] = _cn(2, 9)
+    assert await plugin.art_beat() is True
 
 
 # --- 规则 -----------------------------------------------------------------------
