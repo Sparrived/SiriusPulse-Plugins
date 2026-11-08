@@ -25,6 +25,11 @@ from types import SimpleNamespace
 import pytest
 from PIL import Image, ImageDraw
 
+# 让 tests 目录既能按仓库根、也能按 plugins 目录被收集。
+_ROOT = Path(__file__).resolve().parents[2]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 from sirius_pulse.memory.basic import BasicMemoryFileStore
 from sirius_pulse.memory.basic.models import BasicMemoryEntry
 from sirius_pulse.platforms.onebot_v11.napcat.adapter import NapCatAdapter
@@ -464,3 +469,20 @@ def test_pity_and_rarity_fallback(pool, pity, expected, pity_after):
     cards = [_card(no, rarity) for rarity, no in pool]
     result = draw(cards, random.Random(1), pity=pity)
     assert result.card.rarity == expected and result.pity_after == pity_after
+
+
+def test_card_text_strips_invisible_bidi_marks():
+    from plugins.gacha.visual import _clean_text
+
+    assert _clean_text("池宇健\u2067なのだ\u2067(池宇健)") == "池宇健なのだ(池宇健)"
+
+
+def test_cute_font_falls_back_when_it_lacks_kana():
+    from plugins.gacha.visual import _font, _font_for, _glyph_supported
+
+    cute = _font(30, cute=True)
+    assert not _glyph_supported(cute, "な")
+
+    fallback = _font_for("なのだ", 30, cute=True)
+    assert _glyph_supported(fallback, "な")
+    assert fallback.path != cute.path

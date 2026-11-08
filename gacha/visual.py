@@ -58,6 +58,40 @@ def _font(size: int, bold: bool = False, cute: bool = False) -> ImageFont.FreeTy
     raise OSError("缺少中文字体，请安装 Noto Sans CJK。")
 
 
+# 不可见的双向控制符/零宽字符：群昵称里带进来时，字体会画成方框或空白。
+_INVISIBLE_RE = __import__("re").compile(r"[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff\u00ad]")
+
+
+def _clean_text(text: object) -> str:
+    return _INVISIBLE_RE.sub("", str(text or ""))
+
+
+def _glyph_supported(font: ImageFont.FreeTypeFont, char: str) -> bool:
+    """字体缺字时会画 .notdef 方框；用私用区字符的掩码当基准判断。"""
+    if char.isspace():
+        return True
+    try:
+        missing = Image.Image()._new(font.getmask("\ue000"))
+        current = Image.Image()._new(font.getmask(char))
+    except Exception:
+        return True
+    return not (
+        current.size == missing.size
+        and current.tobytes() == missing.tobytes()
+    )
+
+
+def _font_for(
+    text: str, size: int, bold: bool = False, cute: bool = False
+) -> ImageFont.FreeTypeFont:
+    """可爱字体缺字（假名、生僻字）时退回完整中文字体，避免方框。"""
+    if cute:
+        candidate = _font(size, bold=bold, cute=True)
+        if all(_glyph_supported(candidate, ch) for ch in text):
+            return candidate
+    return _font(size, bold=bold, cute=False)
+
+
 def _wrap(
     draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, width: int
 ) -> list[str]:
@@ -113,7 +147,7 @@ def _avatar(avatar: bytes | None, name: str, size: int) -> Image.Image:
         face = Image.new("RGB", (size, size), (64, 78, 128))
         draw = ImageDraw.Draw(face)
         initial = (name or "?")[0]
-        font = _font(size // 2, cute=True)
+        font = _font_for(initial, size // 2, cute=True)
         box = draw.textbbox((0, 0), initial, font=font)
         draw.text(
             ((size - (box[2] - box[0])) / 2 - box[0], (size - (box[3] - box[1])) / 2 - box[1]),
@@ -167,8 +201,10 @@ def render_card(card: Card, *, avatar: bytes | None, persona_name: str) -> bytes
     )
 
     # 名字与称号
-    _centered(draw, 360, card.subject_name[:14], _font(36, bold=True), _SILVER)
-    _centered(draw, 410, f"「{card.title}」", _font(30, cute=True), _GOLD)
+    subject_name = _clean_text(card.subject_name)
+    title_text = f"「{_clean_text(card.title)}」"
+    _centered(draw, 360, subject_name[:14], _font(36, bold=True), _SILVER)
+    _centered(draw, 410, title_text, _font_for(title_text, 30, cute=True), _GOLD)
 
     # 属性条
     y = 470
@@ -195,22 +231,28 @@ def render_card(card: Card, *, avatar: bytes | None, persona_name: str) -> bytes
     # 技能
     skill_top = y + 14
     skill_font = _font(21)
-    skill_lines = _wrap(draw, card.skill_text, skill_font, CARD_W - 140)[:3]
+    skill_lines = _wrap(draw, _clean_text(card.skill_text), skill_font, CARD_W - 140)[:3]
     skill_bottom = skill_top + 48 + 30 * len(skill_lines)
     draw.rounded_rectangle([48, skill_top, CARD_W - 48, skill_bottom], radius=16, fill=_PANEL)
-    draw.text((70, skill_top + 12), f"技能【{card.skill_name}】", font=_font(23, bold=True), fill=_GOLD)
+    draw.text(
+        (70, skill_top + 12),
+        f"技能【{_clean_text(card.skill_name)}】",
+        font=_font(23, bold=True),
+        fill=_GOLD,
+    )
     for index, line in enumerate(skill_lines):
         draw.text((70, skill_top + 46 + 30 * index), line, font=skill_font, fill=_SILVER)
 
     # 她的批注
-    note_font = _font(21, cute=True)
-    note_lines = _wrap(draw, f"—— {persona_name}：{card.note}", note_font, CARD_W - 120)[:3]
+    note_text = f"—— {_clean_text(persona_name)}：{_clean_text(card.note)}"
+    note_font = _font_for(note_text, 21, cute=True)
+    note_lines = _wrap(draw, note_text, note_font, CARD_W - 120)[:3]
     note_top = CARD_H - 50 - 30 * len(note_lines)
     for index, line in enumerate(note_lines):
         draw.text((60, note_top + 30 * index), line, font=note_font, fill=_SOFT)
 
     base = Image.alpha_composite(base, overlay)
-    base.alpha_composite(_avatar(avatar, card.subject_name, size), (cx - size // 2, top))
+    base.alpha_composite(_avatar(avatar, subject_name, size), (cx - size // 2, top))
     out = io.BytesIO()
     base.convert("RGB").save(out, format="PNG", optimize=True)
     return out.getvalue()
@@ -231,11 +273,13 @@ def render_collection(
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
-    draw.text((_GAP + 8, 30), f"{owner_name[:12]}的图鉴", font=_font(36, bold=True), fill=_SILVER)
+    owner = _clean_text(owner_name)
+    persona = _clean_text(persona_name)
+    draw.text((_GAP + 8, 30), f"{owner[:12]}的图鉴", font=_font(36, bold=True), fill=_SILVER)
     progress = f"已收集 {len(have)}/{len(pool)}"
     draw.text((_GAP + 10, 86), progress, font=_font(22), fill=_GOLD)
-    sign = f"—— {persona_name}画的卡"
-    small = _font(19, cute=True)
+    sign = f"—— {persona}画的卡"
+    small = _font_for(sign, 19, cute=True)
     draw.text(
         (width - _GAP - 8 - draw.textlength(sign, font=small), 92), sign, font=small, fill=_FAINT
     )
@@ -256,9 +300,18 @@ def render_collection(
             )
             draw.text((x + 14, y + 10), f"{card.label} · {card.rarity}", font=_font(17), fill=color)
             draw.text(
-                (x + 14, y + 38), card.subject_name[:8], font=_font(24, bold=True), fill=_SILVER
+                (x + 14, y + 38),
+                _clean_text(card.subject_name)[:8],
+                font=_font(24, bold=True),
+                fill=_SILVER,
             )
-            draw.text((x + 14, y + 74), card.title[:10], font=_font(18, cute=True), fill=_GOLD)
+            cell_title = _clean_text(card.title)[:10]
+            draw.text(
+                (x + 14, y + 74),
+                cell_title,
+                font=_font_for(cell_title, 18, cute=True),
+                fill=_GOLD,
+            )
             if copies > 1:
                 mark = f"×{copies}"
                 font = _font(18, bold=True)
