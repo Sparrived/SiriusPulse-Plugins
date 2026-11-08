@@ -12,11 +12,10 @@ from __future__ import annotations
 import random
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
+from .refresh import LOCAL_TIMEZONE
 from .store import Card
-
-LOCAL_TIMEZONE = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 R, SR, SSR, UR = "R", "SR", "SSR", "UR"
 #: 从低到高。

@@ -38,6 +38,8 @@ from sirius_pulse.plugins.registry import PluginRegistry
 from sirius_pulse.visual import VisualService, policies
 
 GROUP = "730101"
+#: 适配器配置里的 root：阿明的 QQ 号。
+ROOT_QQ = "10001"
 OTHER_GROUP = "730202"
 _CN = timezone(timedelta(hours=8))
 
@@ -220,7 +222,9 @@ class Chat:
         self.clock = [_cn(1, 12)]
         self.rng = random.Random(7)
         self.adapter = NapCatAdapter(
-            "ws://qq.invalid/unconnected", work_path=root, config={"allowed_group_ids": [GROUP]}
+            "ws://qq.invalid/unconnected",
+            work_path=root,
+            config={"allowed_group_ids": [GROUP], "root": ROOT_QQ},
         )
         self.adapter.call_api = self._capture
         self.registry = PluginRegistry()
@@ -370,15 +374,97 @@ async def test_first_draw_paints_the_most_active_member_from_this_group_only(cha
 async def test_one_draw_a_day_and_the_day_turns_at_midnight_china_time(chat):
     await chat.send("/抽卡")
     await chat.send("/抽卡")
-    assert "今天已经抽过" in chat.said() and not chat.images()
+    assert "这一轮已经抽过" in chat.said() and not chat.images()
+    assert "下次刷新：明天 00:00" in chat.said()
 
     chat.clock[0] = _cn(1, 23)
     await chat.send("/抽卡")
-    assert "今天已经抽过" in chat.said()
+    assert "这一轮已经抽过" in chat.said()
 
     chat.clock[0] = _cn(2, 0)
     await chat.send("/抽卡")
     assert len(chat.images()) == 1
+
+
+@pytest.mark.asyncio
+async def test_several_refresh_times_a_day_each_start_a_new_round(chat):
+    plugin = await chat.plugin()
+    plugin.ctx.config["refresh_times"] = "20:00, 08：00 12:00, 25:00"  # 写错的被跳过
+    chat.clock[0] = _cn(1, 9)
+
+    await chat.send("/抽卡")
+    await chat.send("/抽卡")
+    assert "下次刷新：12:00" in chat.said()
+
+    chat.clock[0] = _cn(1, 12)
+    await chat.send("/抽卡")
+    assert len(chat.images()) == 1
+    await chat.send("/抽卡")
+    assert "下次刷新：20:00" in chat.said()
+
+    chat.clock[0] = _cn(1, 21)
+    await chat.send("/抽卡")
+    assert len(chat.images()) == 1
+    await chat.send("/抽卡")
+    assert "下次刷新：明天 08:00" in chat.said()
+
+    # 凌晨两点仍是昨晚 20:00 那一轮。
+    chat.clock[0] = _cn(2, 2)
+    await chat.send("/抽卡")
+    assert not chat.images()
+
+    await chat.send("/抽卡 刷新时间")
+    assert "08:00、12:00、20:00" in chat.said()
+
+
+@pytest.mark.asyncio
+async def test_root_can_refresh_a_group_by_hand_and_nobody_else_can(chat):
+    await chat.send("/抽卡", user="u-hong")
+    await chat.send("/抽卡", user="u-wang")
+
+    await chat.send("/抽卡 刷新", user="u-hong")
+    assert "只有 root" in chat.said()
+    await chat.send("/抽卡", user="u-hong")
+    assert not chat.images(), "不是 root 刷新不了"
+
+    chat.clock[0] += timedelta(minutes=1)
+    await chat.send("/抽卡 刷新", user="u-ming")  # 阿明是 root
+    assert "刷新好了" in chat.said()
+    await chat.send("/抽卡", user="u-hong")
+    await chat.send("/抽卡", user="u-wang")
+    assert len(chat.images()) == 1, "老王这一轮也回来了"
+    await chat.send("/抽卡", user="u-hong")
+    assert not chat.images(), "刷新一次只多一轮"
+
+    # 同一天可以刷新好几次。
+    chat.clock[0] += timedelta(hours=1)
+    await chat.send("/抽卡 刷新", user="u-ming")
+    await chat.send("/抽卡", user="u-hong")
+    assert len(chat.images()) == 1
+
+
+@pytest.mark.asyncio
+async def test_root_sets_this_groups_refresh_times_without_handing_out_free_rounds(chat):
+    chat.clock[0] = _cn(1, 14)
+    await chat.send("/抽卡", user="u-hong")
+
+    await chat.send("/抽卡 刷新时间 08:00 20:00", user="u-hong")
+    assert "只有 root" in chat.said()
+
+    await chat.send("/抽卡 刷新时间 8:00，20:00", user="u-ming")
+    assert "每天 08:00、20:00" in chat.said() and "下次是 20:00" in chat.said()
+    await chat.send("/抽卡", user="u-hong")
+    assert not chat.images(), "改时间不会白送一轮：14 点前一个刷新是 08:00，她已经抽过了"
+
+    await chat.send("/抽卡 刷新时间 吃饭的时候", user="u-ming")
+    assert "没看懂" in chat.said()
+
+    chat.clock[0] = _cn(1, 20)
+    await chat.send("/抽卡", user="u-hong")
+    assert len(chat.images()) == 1
+
+    await chat.send("/抽卡 刷新时间 默认", user="u-ming")
+    assert "每天 00:00" in chat.said()
 
 
 @pytest.mark.asyncio
@@ -533,7 +619,7 @@ def _grant(plugin, user: str, no: int, copies: int = 1) -> None:
             group_id=GROUP,
             owner_id=user,
             card=card,
-            today="2026-01-01",
+            period=datetime(2026, 1, 1, tzinfo=timezone.utc),
             pity_after=0,
             now="2026-01-01T00:00:00+00:00",
         )
@@ -755,7 +841,7 @@ def _scripts(chat) -> int:
 async def test_everyday_lines_come_from_the_script_she_writes_each_week(chat):
     chat.engine.script = script_reply(
         draw_new=["诶嘿，{name}来啦——「{title}」！", "这句少了占位符"],
-        drawn_today=["{nope}今天不行"],
+        drawn_out=["{nope}今天不行"],
     )
     plugin = await _open(chat)  # 她还没写台词本：先用保底句
     assert "抽到了" in chat.said()
@@ -765,7 +851,7 @@ async def test_everyday_lines_come_from_the_script_she_writes_each_week(chat):
     await chat.send("/抽卡", user="u-wang")
     assert "诶嘿" in chat.said(), "她写的那句"
     await chat.send("/抽卡", user="u-wang")
-    assert "今天已经抽过" in chat.said(), "占位符不对的句子被丢掉，退回保底句"
+    assert "这一轮已经抽过" in chat.said(), "占位符不对的句子被丢掉，退回保底句"
 
     await plugin.mint_beat()
     assert _scripts(chat) == 1, "一周只写一本"
@@ -1144,3 +1230,18 @@ def test_a_phase_one_database_keeps_its_cards_after_the_upgrade(tmp_path):
     assert card.kind == KIND_MEMBER and card.supply == 0
     [item] = store.collection("g", "u-hong")
     assert item.copies == 2 and item.stars == 1 and item.notes == []
+
+
+@pytest.mark.parametrize(
+    ("stored", "now", "used"),
+    [
+        ("2026-11-01", _cn(1, 15), True),  # 升级前当天抽过：升级后这一轮仍算抽过
+        ("2026-11-01", _cn(2, 0), False),  # 过了零点：新的一轮
+        ("", _cn(1, 15), False),
+        ("乱码", _cn(1, 15), False),
+    ],
+)
+def test_a_draw_recorded_before_the_upgrade_still_counts_for_that_day(stored, now, used):
+    from plugins.gacha.refresh import Schedule, in_period
+
+    assert in_period(stored, Schedule().period_start(now)) is used

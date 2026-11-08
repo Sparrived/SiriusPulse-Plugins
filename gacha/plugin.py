@@ -47,6 +47,7 @@ from .members import (
     recent_lines,
     resolve_person,
 )
+from .refresh import DEFAULT_TIMES, Schedule, describe_next, format_times, parse_times
 from .rules import PITY_AT, RARITIES, SR, SSR, UR, R, draw, has_high_rarity, local_today
 from .store import (
     KIND_AWAKENED,
@@ -78,7 +79,7 @@ from .writer import (
 
 _HELP = (
     "群友图鉴\n"
-    "/抽卡：每天一抽，抽到群友的收藏卡\n"
+    "/抽卡：抽一张群友的收藏卡，次数到点刷新；/抽卡 刷新时间 看什么时候刷新\n"
     "/图鉴：看看你收集了哪些卡\n"
     "/卡 <名字或编号>：看一张你已经抽到的卡\n"
     "/送卡 <人> <编号>：把一张卡送给别人\n"
@@ -136,7 +137,17 @@ class GachaPlugin(PluginBase):
             "name": "draws_per_day",
             "type": "int",
             "default": 1,
-            "description": "每人每天在每个群能抽几次（按中国时间的自然日重置）。",
+            "description": "每次刷新后，每人在每个群能抽几次。",
+        },
+        {
+            "name": "refresh_times",
+            "type": "str",
+            "default": "00:00",
+            "description": (
+                "抽卡次数每天几点刷新（中国时间），可以写好几个，用逗号或空格隔开，"
+                "比如 00:00, 12:00, 20:00。写错的会被跳过，一个都不对就按 00:00。"
+                "root 可以在群里用 /抽卡 刷新时间 给单个群另设。"
+            ),
         },
         {
             "name": "min_messages",
@@ -179,7 +190,8 @@ class GachaPlugin(PluginBase):
             "群友发 /我的卡 退出 即可删掉自己的卡和自己出演的名场面。"
         ),
         "parameters": {
-            "draws_per_day": {"label": "每人每天抽几次"},
+            "draws_per_day": {"label": "每轮每人抽几次"},
+            "refresh_times": {"label": "每天几点刷新"},
             "min_messages": {"label": "发言多少句才入画"},
             "cards_per_beat": {"label": "每次心跳最多画几张"},
             "cards_per_day": {"label": "每天最多画几张"},
@@ -347,14 +359,22 @@ class GachaPlugin(PluginBase):
 
     # ── 抽卡 ──────────────────────────────────────────────────────────
 
-    async def _draw(self, group_id: str, _args: list[str]) -> PluginResponse:
+    async def _draw(self, group_id: str, args: list[str]) -> PluginResponse:
+        if args and args[0] == "刷新":
+            return self._refresh(group_id)
+        if args and args[0] == "刷新时间":
+            return self._refresh_times(group_id, args[1:])
         store = self._gacha()
         owner = self._owner_id()
-        today = local_today(_now())
+        schedule = self._schedule(group_id)
+        period = schedule.period_start(_now())
         player = store.player(group_id, owner)
-        per_day = self._option("draws_per_day", 1, low=1, high=20)
-        if player.draws_left(today, per_day) <= 0:
-            return PluginResponse.ok(text=self._line("drawn_today"))
+        per_period = self._option("draws_per_day", 1, low=1, high=20)
+        if player.draws_left(period, per_period) <= 0:
+            # 下次几点刷新是规则，由系统接在她的话后面。
+            return PluginResponse.ok(
+                text=f"{self._line('drawn_out')}（下次刷新：{describe_next(schedule, _now())}）"
+            )
 
         store.mark_playing(group_id, _now().isoformat())
         pool = store.cards(group_id)
@@ -374,7 +394,7 @@ class GachaPlugin(PluginBase):
                     group_id=group_id,
                     owner_id=owner,
                     card=result.card,
-                    today=today,
+                    period=period,
                     pity_after=result.pity_after,
                     now=_now().isoformat(),
                 )
@@ -395,6 +415,59 @@ class GachaPlugin(PluginBase):
         return self._image(
             text, await self._render(card, store.owned(group_id, owner, card.card_id))
         )
+
+    # ── 刷新 ──────────────────────────────────────────────────────────
+
+    def _schedule(self, group_id: str) -> Schedule:
+        """本群的刷新安排：root 给本群设过就用本群的，否则用插件配置。"""
+        settings = self._gacha().group_settings(group_id)
+        times = parse_times(settings.refresh_times) or parse_times(
+            self.ctx.config.get("refresh_times", "00:00")
+        )
+        return Schedule(times=times or DEFAULT_TIMES, manual_at=_parse(settings.manual_refresh_at))
+
+    def _refresh(self, group_id: str) -> PluginResponse:
+        """root 手动刷新本群：从现在起是新的一轮，每个人的次数都回来了（保底不动）。"""
+        if not self._is_root():
+            return PluginResponse.ok(text="手动刷新只有 root 能用。")
+        self._gacha().refresh_now(group_id, _now().isoformat())
+        return PluginResponse.ok(text=self._line("refreshed"))
+
+    def _refresh_times(self, group_id: str, args: list[str]) -> PluginResponse:
+        """看本群几点刷新；root 可以给本群另设（一天多个），或者恢复成插件配置。"""
+        schedule = self._schedule(group_id)
+        if not args:
+            return PluginResponse.ok(
+                text=(
+                    f"本群每天 {format_times(schedule.times)} 刷新抽卡次数，"
+                    f"下次是 {describe_next(schedule, _now())}。"
+                )
+            )
+        if not self._is_root():
+            return PluginResponse.ok(text="改刷新时间只有 root 能用。")
+        store = self._gacha()
+        if args == ["默认"]:
+            store.set_refresh_times(group_id, "")
+            schedule = self._schedule(group_id)
+            return PluginResponse.ok(text=f"好，本群恢复默认：每天 {format_times(schedule.times)} 刷新。")
+        times = parse_times(" ".join(args))
+        if not times:
+            return PluginResponse.ok(text="没看懂这个时间。用法：/抽卡 刷新时间 08:00 20:00（中国时间，可以写好几个）")
+        store.set_refresh_times(group_id, format_times(times))
+        schedule = self._schedule(group_id)
+        return PluginResponse.ok(
+            text=(f"好，本群改成每天 {format_times(times)} 刷新，" f"下次是 {describe_next(schedule, _now())}。")
+        )
+
+    def _is_root(self) -> bool:
+        """发指令的人是不是适配器配置里的 root。
+
+        只比对平台给的发送者账号（QQ 号），不看昵称；没有适配器或没配 root 一律不是。
+        """
+        config = getattr(self.ctx.adapter, "plugin_config", None)
+        root = str(config.get("root", "") if isinstance(config, dict) else "").strip()
+        uid = str(self.ctx.message.channel_user_id or "").strip()
+        return bool(root) and uid == root
 
     async def _draw_line(self, group_id: str, card: Card, copies: int) -> str:
         """这一抽她说什么：SR 以上的新卡她现场说，其余从她的台词本里挑。"""

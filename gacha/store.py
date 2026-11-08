@@ -31,6 +31,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
 
+from .refresh import in_period
+
 KIND_MEMBER = "member"
 KIND_MOOD = "mood"
 KIND_MOMENT = "moment"
@@ -74,6 +76,12 @@ CREATE TABLE IF NOT EXISTS players (
     total      INTEGER NOT NULL DEFAULT 0,
     pity       INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (group_id, owner_id)
+);
+
+CREATE TABLE IF NOT EXISTS group_settings (
+    group_id          TEXT PRIMARY KEY,
+    refresh_times     TEXT NOT NULL DEFAULT '',
+    manual_refresh_at TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS playing (
@@ -230,14 +238,23 @@ class Card:
 
 @dataclass(slots=True)
 class Player:
+    #: 上次抽卡的时刻（UTC ISO）。列名是历史遗留：早期按自然日刷新，存的是日期。
     draw_date: str = ""
     draws_today: int = 0
     total: int = 0
     pity: int = 0
 
-    def draws_left(self, today: str, per_day: int) -> int:
-        used = self.draws_today if self.draw_date == today else 0
-        return max(0, per_day - used)
+    def draws_left(self, period_start: datetime, per_period: int) -> int:
+        used = self.draws_today if in_period(self.draw_date, period_start) else 0
+        return max(0, per_period - used)
+
+
+@dataclass(slots=True)
+class GroupSettings:
+    #: 本群单独设置的刷新时刻（root 用指令设的）；空表示跟插件配置走。
+    refresh_times: str = ""
+    #: 本群最近一次手动刷新（UTC ISO），没有是空串。
+    manual_refresh_at: str = ""
 
 
 @dataclass(slots=True)
@@ -527,6 +544,35 @@ class GachaStore:
             row = conn.execute(sql, params).fetchone()
         return str(row[0] or "")
 
+    # ── 刷新设置 ──────────────────────────────────────────────────────
+
+    def group_settings(self, group_id: str) -> GroupSettings:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT refresh_times, manual_refresh_at FROM group_settings WHERE group_id = ?",
+                (group_id,),
+            ).fetchone()
+        if row is None:
+            return GroupSettings()
+        return GroupSettings(refresh_times=row[0], manual_refresh_at=row[1])
+
+    def set_refresh_times(self, group_id: str, times: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO group_settings (group_id, refresh_times) VALUES (?, ?)
+                ON CONFLICT (group_id) DO UPDATE SET refresh_times = excluded.refresh_times""",
+                (group_id, times),
+            )
+
+    def refresh_now(self, group_id: str, now: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO group_settings (group_id, manual_refresh_at) VALUES (?, ?)
+                ON CONFLICT (group_id) DO UPDATE SET
+                    manual_refresh_at = excluded.manual_refresh_at""",
+                (group_id, now),
+            )
+
     # ── 哪些群在玩 ────────────────────────────────────────────────────
 
     def mark_playing(self, group_id: str, now: str) -> None:
@@ -599,7 +645,7 @@ class GachaStore:
         group_id: str,
         owner_id: str,
         card: Card,
-        today: str,
+        period: datetime,
         pity_after: int,
         now: str,
     ) -> int:
@@ -619,7 +665,7 @@ class GachaStore:
                 "SELECT draw_date, draws_today FROM players WHERE group_id = ? AND owner_id = ?",
                 (group_id, owner_id),
             ).fetchone()
-            used = int(row["draws_today"]) if row and row["draw_date"] == today else 0
+            used = int(row["draws_today"]) if row and in_period(row["draw_date"], period) else 0
             conn.execute(
                 """INSERT INTO players (group_id, owner_id, draw_date, draws_today, total, pity)
                 VALUES (?, ?, ?, ?, 1, ?)
@@ -628,7 +674,7 @@ class GachaStore:
                     draws_today = excluded.draws_today,
                     total = total + 1,
                     pity = excluded.pity""",
-                (group_id, owner_id, today, used + 1, pity_after),
+                (group_id, owner_id, now, used + 1, pity_after),
             )
             _give(conn, group_id, owner_id, card.card_id, now)
             copies = conn.execute(

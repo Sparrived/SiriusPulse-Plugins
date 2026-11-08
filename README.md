@@ -7,7 +7,7 @@ External plugins for [Sirius Pulse](https://github.com/Sparrived/SiriusPulse).
 - `github_monitor`: monitors configured GitHub repositories through Poll or Webhook delivery and sends aggregated Issue, Pull Request, Release, Comment, and Push notifications with optional screenshots.
 - `sub2api_monitor`: monitors Sub2API subscription listing changes and group rate multipliers, then notifies configured chats.
 - `amkr_accounts`: reads AMKR CPA/subscription account resources through `/amkr account [selector]` and channel health through `/amkr status [hours]`, sending locally rendered dashboards to the current group (all group members can query). See [AMKR Accounts](amkr_accounts/README.md).
-- `gacha`: 群友图鉴 — the persona draws collectible cards of group members from their public messages in that group; members draw one a day with `/抽卡`, view progress with `/图鉴`, gift/trade/star-up with `/送卡` `/交换` `/升星`, and opt out with `/我的卡 退出`; lively group moments become limited UR cards quoting what was really said. See [群友图鉴](gacha/README.md).
+- `gacha`: 群友图鉴 — the persona draws collectible cards of group members from their public messages in that group; members draw with `/抽卡` on configurable refresh times (root can refresh by hand), view progress with `/图鉴`, gift/trade/star-up with `/送卡` `/交换` `/升星`, and opt out with `/我的卡 退出`; lively group moments become limited UR cards quoting what was really said. See [群友图鉴](gacha/README.md).
 
 ## Installation
 
