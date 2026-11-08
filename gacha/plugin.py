@@ -7,8 +7,9 @@
   引用原话的限量卡，并配一张插画；
 - 她心情好的时候大家手气也好一点。
 
-**她的声音**：所有字都走宿主的对话生成链路（带完整人设），常说的话来自她每周自己
-写的台词本，关键时刻（抽到 SR 以上、升星、觉醒画好）现场说。
+**她的声音**：每一句回复都是她现场说的，走宿主的对话生成链路（带完整人设），提示里
+带上此刻的情况、她的心情和她最近说过的话（让她别重复）。指令用法、刷新时间、保底
+这些规则请她原样说出来，漏了由系统补上。她开不了口时才用她每周写的台词本兜底。
 
 卡都在后台慢慢画（每次心跳、每天都有上限），只在有人玩过的群里画；插画由另一个
 后台任务一张张画，画好了她在群里叫人。
@@ -25,6 +26,8 @@ import asyncio
 import base64
 import random
 import time
+from collections import deque
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -61,12 +64,22 @@ from .store import (
     SoldOut,
 )
 from .visual import render_card, render_collection
-from .voice import Script, build_script_prompt, parse_script
+from .voice import (
+    RECENT_LINES,
+    Must,
+    Script,
+    build_live_prompt,
+    build_script_prompt,
+    finish,
+    mood_words,
+    must,
+    parse_live,
+    parse_script,
+)
 from .writer import (
     build_awaken_prompt,
     build_moment_prompt,
     build_prompt,
-    build_reaction_prompt,
     build_scene_prompt,
     build_star_prompt,
     image_prompt,
@@ -78,7 +91,6 @@ from .writer import (
 )
 
 _HELP = (
-    "群友图鉴\n"
     "/抽卡：抽一张群友的收藏卡，次数到点刷新；/抽卡 刷新时间 看什么时候刷新\n"
     "/图鉴：看看你收集了哪些卡\n"
     "/卡 <名字或编号>：看一张你已经抽到的卡\n"
@@ -96,6 +108,34 @@ _LIKENESS_FALLBACK_NOTES = {
     "required_asset_missing": "还没有登记形象图",
     "asset_invalid": "登记的形象图停用了",
 }
+
+#: 指令写错时由系统补上的用法（她说完话后接在后面，规则不交给她发挥）。
+_USAGE = {
+    "gift": must("用法：/送卡 <人> <编号>，比如 /送卡 小红 17", "/送卡 小红 17", block=True),
+    "trade": must(
+        "用法：/交换 <人> <我的编号> <他的编号>，比如 /交换 小红 17 32",
+        "/交换 小红 17 32",
+        block=True,
+    ),
+    "star": must("用法：/升星 <编号>，比如 /升星 17", "/升星 17", block=True),
+    "awaken": must("用法：/觉醒 <编号>，比如 /觉醒 17", "/觉醒 17", block=True),
+    "view": must("用法：/卡 阿明 或 /卡 17", "/卡 17", block=True),
+    "refresh": must(
+        "用法：/抽卡 刷新时间 08:00 20:00（中国时间，可以写好几个）",
+        "/抽卡 刷新时间 08:00 20:00",
+        block=True,
+    ),
+    "mine": must(
+        "用法：/我的卡、/我的卡 退出、/我的卡 加入、/我的卡 画我、/我的卡 不画我",
+        "/我的卡 退出",
+        "/我的卡 加入",
+        "/我的卡 画我",
+        "/我的卡 不画我",
+        block=True,
+    ),
+}
+#: 她现场说一句最多等这么久，超时就用台词本。
+_LIVE_TIMEOUT_SECONDS = 25.0
 
 _AVATAR_URL = "https://q1.qlogo.cn/g?b=qq&nk={uid}&s=640"
 _AVATAR_TTL_SECONDS = 7 * 24 * 3600
@@ -123,7 +163,7 @@ class GachaPlugin(PluginBase):
     _plugin_name = "gacha"
     _plugin_display_name = "群友图鉴"
     _plugin_description = "她给群友画收藏卡：/抽卡 每天一抽，/图鉴 看收集进度，/送卡 /交换 /升星 /觉醒，" "/我的卡 退出 随时不再入画。"
-    _plugin_version = "0.4.0"
+    _plugin_version = "0.5.0"
     _plugin_author = "Sirius Pulse"
     _plugin_min_framework_version = "1.3.0"
     _plugin_dependencies = ["httpx>=0.24.0", "Pillow>=9.0.0"]
@@ -179,6 +219,14 @@ class GachaPlugin(PluginBase):
             "default": 3,
             "description": "她每天最多画几张插画（觉醒卡和名场面合计，每张一次生图）；0 表示不画。",
         },
+        {
+            "name": "live_voice",
+            "type": "bool",
+            "default": True,
+            "description": (
+                "每句回复都由她现场说（每条指令一次模型调用）。关掉后只用她每周写的台词本，" "台词本里没有的场合用固定的保底句，省调用但听起来没那么像她。"
+            ),
+        },
     ]
     _plugin_ui_schema = {
         "version": 1,
@@ -197,6 +245,7 @@ class GachaPlugin(PluginBase):
             "cards_per_day": {"label": "每天最多画几张"},
             "moment_supply": {"label": "名场面卡限量几份"},
             "art_per_day": {"label": "每天最多画几张插画"},
+            "live_voice": {"label": "每句回复都现场说"},
         },
     }
 
@@ -206,6 +255,8 @@ class GachaPlugin(PluginBase):
         self._mint_lock = asyncio.Lock()
         self._art_lock = asyncio.Lock()
         self._rng = random.Random()
+        #: 她最近在每个群里现场说过的话，提示里带上让她换个说法。
+        self._recent: dict[str, deque[str]] = {}
 
     # ── 指令声明（匹配用；实际分发在 execute_async） ──────────────────
 
@@ -332,10 +383,8 @@ class GachaPlugin(PluginBase):
     async def execute_async(self, cmd: CommandAST) -> list[PluginResponse]:
         group_id = self.ctx.message.group_id
         if not group_id or group_id.startswith("private_"):
-            return [PluginResponse.fail("图鉴是按群收集的，请在群里玩。")]
+            return [PluginResponse.ok(text=await self._speak("private_chat", group_id=group_id))]
         args = [str(arg.value) for arg in cmd.args]
-        if args and args[0] in {"help", "帮助"}:
-            return [PluginResponse.ok(text=_HELP)]
         handlers = {
             "抽卡": self._draw,
             "图鉴": self._collection,
@@ -349,21 +398,28 @@ class GachaPlugin(PluginBase):
             "觉醒": self._awaken,
         }
         handler = handlers.get(cmd.command)
-        if handler is None:
-            return [PluginResponse.ok(text=_HELP)]
+        if handler is None or (args and args[0] in {"help", "帮助"}):
+            # 指令列表是规则，整段由系统接在她的话后面。
+            return [
+                PluginResponse.ok(text=await self._speak("help", group_id=group_id, tail=_HELP))
+            ]
         try:
             return [await handler(group_id, args)]
         except OSError as exc:
             self.logger.warning("图鉴画图失败：%s", exc)
-            return [PluginResponse.fail("画卡失败了，可能是缺少中文字体。")]
+            return [PluginResponse.ok(text=await self._speak("render_failed", group_id=group_id))]
+
+    async def _reply(self, group_id: str, occasion: str, **kwargs: Any) -> PluginResponse:
+        """一句纯文字回复：她现场说。"""
+        return PluginResponse.ok(text=await self._speak(occasion, group_id=group_id, **kwargs))
 
     # ── 抽卡 ──────────────────────────────────────────────────────────
 
     async def _draw(self, group_id: str, args: list[str]) -> PluginResponse:
         if args and args[0] == "刷新":
-            return self._refresh(group_id)
+            return await self._refresh(group_id)
         if args and args[0] == "刷新时间":
-            return self._refresh_times(group_id, args[1:])
+            return await self._refresh_times(group_id, args[1:])
         store = self._gacha()
         owner = self._owner_id()
         schedule = self._schedule(group_id)
@@ -371,9 +427,9 @@ class GachaPlugin(PluginBase):
         player = store.player(group_id, owner)
         per_period = self._option("draws_per_day", 1, low=1, high=20)
         if player.draws_left(period, per_period) <= 0:
-            # 下次几点刷新是规则，由系统接在她的话后面。
-            return PluginResponse.ok(
-                text=f"{self._line('drawn_out')}（下次刷新：{describe_next(schedule, _now())}）"
+            upcoming = describe_next(schedule, _now())
+            return await self._reply(
+                group_id, "drawn_out", musts=[must(f"下次刷新：{upcoming}", upcoming)]
             )
 
         store.mark_playing(group_id, _now().isoformat())
@@ -388,7 +444,7 @@ class GachaPlugin(PluginBase):
         for _ in range(_SOLD_OUT_RETRIES):
             result = draw(pool, self._rng, pity=player.pity, lucky=lucky)
             if result is None:
-                return PluginResponse.ok(text=self._line("pool_empty"))
+                return await self._reply(group_id, "pool_empty")
             try:
                 copies = store.record_draw(
                     group_id=group_id,
@@ -403,15 +459,38 @@ class GachaPlugin(PluginBase):
                 # 刚好被别人抽走了最后一份：换一张重抽，这次不扣次数。
                 pool = store.cards(group_id)
         else:
-            return PluginResponse.ok(text="卡池正忙，等一下再抽吧。")
+            return await self._reply(group_id, "pool_busy")
 
         card = result.card
-        text = await self._draw_line(group_id, card, copies)
+        facts: list[str] = []
+        musts: list[Must] = []
+        if card.kind == KIND_MOMENT:
+            facts.append(f"这是一张名场面卡，引用的原话是「{card.quote}」")
+        elif card.note:
+            facts.append(f"你在这张卡角写过的批注是「{card.note}」")
         if lucky:
-            text += self._line("lucky")
+            facts.append("你今天心情好，把大家的抽卡手气调高了一点，可以顺口提一句")
         if has_high_rarity(pool):
             # 只有卡池里真的还有抽得到的 SSR 以上时，保底才有意义，才提。
-            text += f"（距离保底还有 {PITY_AT - result.pity_after} 抽）"
+            left = PITY_AT - result.pity_after
+            musts.append(must(f"距离保底还有 {left} 抽", f"{left} 抽"))
+        if card.kind != KIND_MOMENT and card.subject_id == owner:
+            occasion, values = "draw_self", {"title": card.title}
+        elif copies > 1:
+            occasion, values = "draw_duplicate", {"name": card.name, "copies": copies}
+        elif RARITIES.index(card.rarity) >= RARITIES.index(SR):
+            occasion = "draw_rare"
+            values = {"name": card.name, "title": card.title, "rarity": card.rarity}
+        else:
+            occasion, values = "draw_new", {"name": card.name, "title": card.title}
+        text = await self._speak(
+            occasion,
+            group_id=group_id,
+            facts=facts,
+            musts=musts,
+            also=("lucky",) if lucky else (),
+            **values,
+        )
         return self._image(
             text, await self._render(card, store.owned(group_id, owner, card.card_id))
         )
@@ -426,37 +505,39 @@ class GachaPlugin(PluginBase):
         )
         return Schedule(times=times or DEFAULT_TIMES, manual_at=_parse(settings.manual_refresh_at))
 
-    def _refresh(self, group_id: str) -> PluginResponse:
+    async def _refresh(self, group_id: str) -> PluginResponse:
         """root 手动刷新本群：从现在起是新的一轮，每个人的次数都回来了（保底不动）。"""
         if not self._is_root():
-            return PluginResponse.ok(text="手动刷新只有 root 能用。")
+            return await self._reply(group_id, "root_only", what="手动刷新抽卡次数")
         self._gacha().refresh_now(group_id, _now().isoformat())
-        return PluginResponse.ok(text=self._line("refreshed"))
+        return await self._reply(group_id, "refreshed")
 
-    def _refresh_times(self, group_id: str, args: list[str]) -> PluginResponse:
+    async def _refresh_times(self, group_id: str, args: list[str]) -> PluginResponse:
         """看本群几点刷新；root 可以给本群另设（一天多个），或者恢复成插件配置。"""
         schedule = self._schedule(group_id)
         if not args:
-            return PluginResponse.ok(
-                text=(
-                    f"本群每天 {format_times(schedule.times)} 刷新抽卡次数，"
-                    f"下次是 {describe_next(schedule, _now())}。"
-                )
+            return await self._reply(
+                group_id, "refresh_schedule", musts=_schedule_musts(schedule), **_when(schedule)
             )
         if not self._is_root():
-            return PluginResponse.ok(text="改刷新时间只有 root 能用。")
+            return await self._reply(group_id, "root_only", what="改抽卡的刷新时间")
         store = self._gacha()
         if args == ["默认"]:
             store.set_refresh_times(group_id, "")
             schedule = self._schedule(group_id)
-            return PluginResponse.ok(text=f"好，本群恢复默认：每天 {format_times(schedule.times)} 刷新。")
+            return await self._reply(
+                group_id,
+                "refresh_reset",
+                musts=_schedule_musts(schedule)[:1],
+                times=format_times(schedule.times),
+            )
         times = parse_times(" ".join(args))
         if not times:
-            return PluginResponse.ok(text="没看懂这个时间。用法：/抽卡 刷新时间 08:00 20:00（中国时间，可以写好几个）")
+            return await self._reply(group_id, "refresh_bad_time", musts=[_USAGE["refresh"]])
         store.set_refresh_times(group_id, format_times(times))
         schedule = self._schedule(group_id)
-        return PluginResponse.ok(
-            text=(f"好，本群改成每天 {format_times(times)} 刷新，" f"下次是 {describe_next(schedule, _now())}。")
+        return await self._reply(
+            group_id, "refresh_set", musts=_schedule_musts(schedule), **_when(schedule)
         )
 
     def _is_root(self) -> bool:
@@ -469,26 +550,6 @@ class GachaPlugin(PluginBase):
         uid = str(self.ctx.message.channel_user_id or "").strip()
         return bool(root) and uid == root
 
-    async def _draw_line(self, group_id: str, card: Card, copies: int) -> str:
-        """这一抽她说什么：SR 以上的新卡她现场说，其余从她的台词本里挑。"""
-        if copies == 1 and RARITIES.index(card.rarity) >= RARITIES.index(SR):
-            said = await self._say(
-                build_reaction_prompt(
-                    drawer=self._speaker_name(),
-                    card_name=card.name,
-                    title=card.title,
-                    rarity=card.rarity,
-                ),
-                group_id,
-            )
-            if said:
-                return said
-        if card.kind != KIND_MOMENT and card.subject_id == self._owner_id():
-            return self._line("draw_self", title=card.title)
-        if copies > 1:
-            return self._line("draw_duplicate", name=card.name, copies=copies)
-        return self._line("draw_new", name=card.name, title=card.title)
-
     # ── 图鉴与看卡 ────────────────────────────────────────────────────
 
     async def _collection(self, group_id: str, _args: list[str]) -> PluginResponse:
@@ -496,7 +557,7 @@ class GachaPlugin(PluginBase):
         owner = self._owner_id()
         pool = store.visible_cards(group_id, owner)
         if not pool:
-            return PluginResponse.ok(text="这个群的图鉴还是空的。先 /抽卡 试试？")
+            return await self._reply(group_id, "collection_empty", musts=[must("先 /抽卡 试试", "/抽卡")])
         owned = store.collection(group_id, owner)
         png = await asyncio.to_thread(
             render_collection,
@@ -505,12 +566,20 @@ class GachaPlugin(PluginBase):
             pool=pool,
             persona_name=self._persona_name(),
         )
-        return self._image(f"已收集 {len(owned)}/{len(pool)}", png)
+        got, total = len(owned), len(pool)
+        text = await self._speak(
+            "collection_progress",
+            group_id=group_id,
+            musts=[must(f"已收集 {got}/{total}", str(got), str(total))],
+            got=got,
+            total=total,
+        )
+        return self._image(text, png)
 
     async def _view(self, group_id: str, args: list[str]) -> PluginResponse:
         query = " ".join(args).strip()
         if not query:
-            return PluginResponse.ok(text="想看哪张？用法：/卡 阿明 或 /卡 17")
+            return await self._reply(group_id, "view_usage", musts=[_USAGE["view"]])
         store = self._gacha()
         owner = self._owner_id()
         owned = {item.card.card_id: item for item in store.collection(group_id, owner)}
@@ -518,12 +587,17 @@ class GachaPlugin(PluginBase):
         candidates = [item.card for item in owned.values()] + ([mine] if mine else [])
         for card in candidates:
             if _matches(card, query):
-                return self._image(
-                    f"{card.label} · {card.name}", await self._render(card, owned.get(card.card_id))
+                text = await self._speak(
+                    "view_card",
+                    group_id=group_id,
+                    facts=[f"你在卡角写过的批注是「{card.note}」"] if card.note else [],
+                    card=_label(card),
+                    name=card.name,
                 )
+                return self._image(text, await self._render(card, owned.get(card.card_id)))
         if any(_matches(card, query) for card in store.visible_cards(group_id, owner)):
-            return PluginResponse.ok(text="这张你还没抽到哦，偷看可不行。")
-        return PluginResponse.ok(text="图鉴里没有这张卡。")
+            return await self._reply(group_id, "view_locked")
+        return await self._reply(group_id, "view_missing", query=query)
 
     async def _mine(self, group_id: str, args: list[str]) -> PluginResponse:
         action = " ".join(args).strip()
@@ -536,27 +610,34 @@ class GachaPlugin(PluginBase):
             store.opt_out(group_id, owner, now)
             self._forget_art(doomed)
             await self._revoke_likeness(group_id, owner)
-            return PluginResponse.ok(text=self._line("opted_out"))
+            return await self._reply(group_id, "opted_out")
         if action in {"加入", "回来"}:
             if store.opt_in(group_id, owner):
-                return PluginResponse.ok(text=self._line("opted_in"))
-            return PluginResponse.ok(text="你本来就在图鉴里呀。")
+                return await self._reply(group_id, "opted_in")
+            return await self._reply(group_id, "already_in")
         if action in {"画我", "照我画"}:
             return await self._consent_likeness(group_id, owner)
         if action in {"不画我", "别画我"}:
             return await self._withdraw_likeness(group_id, owner)
         if action:
-            return PluginResponse.ok(text="用法：/我的卡、/我的卡 退出、/我的卡 加入、/我的卡 画我、/我的卡 不画我")
+            return await self._reply(group_id, "mine_usage", musts=[_USAGE["mine"]])
         if owner in store.opted_out(group_id):
-            return PluginResponse.ok(text="你退出了图鉴，所以我没有画你。想回来的话发 /我的卡 加入。")
+            return await self._reply(
+                group_id, "mine_opted_out", musts=[must("想回来发 /我的卡 加入", "/我的卡 加入")]
+            )
         card = store.card_of(group_id, owner)
         if card is None:
-            return PluginResponse.ok(text=self._line("no_card_yet"))
-        caption = f"我给你画的卡：「{card.title}」"
+            return await self._reply(group_id, "no_card_yet")
+        facts = [f"你在卡角写给他的批注是「{card.note}」"] if card.note else []
+        musts = []
         if store.likeness_consent(group_id, owner):
-            caption += "（你同意了觉醒插画照你本人的样子画，/我的卡 不画我 可以撤回）"
+            facts.append("他同意过觉醒插画照他本人的样子画")
+            musts.append(must("/我的卡 不画我 可以撤回", "/我的卡 不画我"))
+        text = await self._speak(
+            "mine_card", group_id=group_id, facts=facts, musts=musts, title=card.title
+        )
         return self._image(
-            caption, await self._render(card, store.owned(group_id, owner, card.card_id))
+            text, await self._render(card, store.owned(group_id, owner, card.card_id))
         )
 
     # ── 画我：同意与撤回 ──────────────────────────────────────────────
@@ -565,7 +646,11 @@ class GachaPlugin(PluginBase):
         """本人同意：用他这条消息的来源证据在视觉资产系统里记一条授权。"""
         store = self._gacha()
         if owner in store.opted_out(group_id):
-            return PluginResponse.ok(text="你退出了图鉴，我不会画你。想回来先发 /我的卡 加入。")
+            return await self._reply(
+                group_id,
+                "likeness_opted_out",
+                musts=[must("想回来先发 /我的卡 加入", "/我的卡 加入")],
+            )
         try:
             consent = self.ctx.engine.grant_person_image_consent(
                 user_id=owner, group_id=group_id, evidence_ref=self.ctx.message.evidence_ref
@@ -573,13 +658,15 @@ class GachaPlugin(PluginBase):
         except PersonImageError as exc:
             self.logger.info("「画我」没有记下：%s", exc.code)
             if exc.code == "unavailable":
-                return PluginResponse.ok(text="这里还没接上形象登记，我暂时没法照你本人的样子画。")
-            return PluginResponse.ok(text="我没法确认这句话是你本人发的，过一会儿再说一次吧。")
+                return await self._reply(group_id, "likeness_unavailable")
+            return await self._reply(group_id, "likeness_unverified")
         store.set_likeness_consent(group_id, owner, consent["grant_id"], _now().isoformat())
-        text = self._line("likeness_on")
+        facts, musts = [], []
         if not consent.get("has_reference"):
-            text += "（你还没在我这里登记过形象图，登记之前插画里还是用象征物代表你。）"
-        return PluginResponse.ok(text=text + "不想了随时发 /我的卡 不画我。")
+            facts.append("他还没在你这里登记过形象图（比如发照片说“记一下我的样子”）")
+            musts.append(must("你还没在我这里登记过形象图，登记之前插画里还是用象征物代表你", "登记", "象征物"))
+        musts.append(must("不想了随时发 /我的卡 不画我", "/我的卡 不画我"))
+        return await self._reply(group_id, "likeness_on", facts=facts, musts=musts)
 
     async def _withdraw_likeness(self, group_id: str, owner: str) -> PluginResponse:
         store = self._gacha()
@@ -587,11 +674,12 @@ class GachaPlugin(PluginBase):
         taken_down = self._take_down_likeness(group_id, owner)
         revoked = await self._revoke_likeness(group_id, owner)
         if not (had or taken_down or revoked):
-            return PluginResponse.ok(text="我本来就没有照你本人的样子画你呀。")
-        text = self._line("likeness_off")
+            return await self._reply(group_id, "likeness_never")
+        facts, musts = [], []
         if taken_down:
-            text += f"（已经照你画好的 {taken_down} 张插画也撤下了，卡还在。）"
-        return PluginResponse.ok(text=text)
+            facts.append(f"已经照他画好的 {taken_down} 张觉醒插画你也撤下了，卡本身还在")
+            musts.append(must(f"已经照你画好的 {taken_down} 张插画也撤下了，卡还在", f"{taken_down} 张"))
+        return await self._reply(group_id, "likeness_off", facts=facts, musts=musts)
 
     def _take_down_likeness(self, group_id: str, subject_id: str) -> int:
         """撤回同意：插件这边的同意删掉，照他本人画的插画从卡上撤下、文件删掉。
@@ -633,19 +721,19 @@ class GachaPlugin(PluginBase):
 
     async def _gift(self, group_id: str, args: list[str]) -> PluginResponse:
         if len(args) != 2:
-            return PluginResponse.ok(text="用法：/送卡 <人> <编号>，比如 /送卡 小红 17")
+            return await self._reply(group_id, "gift_usage", musts=[_USAGE["gift"]])
         target = self._person(group_id, args[0])
         if target is None:
-            return PluginResponse.ok(text=f"我不知道「{args[0]}」是群里的谁，换个名字或者直接 @ 他试试。")
+            return await self._reply(group_id, "who_unknown", name=args[0])
         owner = self._owner_id()
         if target[0] == owner:
-            return PluginResponse.ok(text="送给自己？这张本来就是你的呀。")
+            return await self._reply(group_id, "gift_self")
         store = self._gacha()
         item = self._find_owned(group_id, owner, args[1])
         if item is None:
-            return PluginResponse.ok(text=f"你手里没有 {args[1]} 这张卡。")
+            return await self._reply(group_id, "not_owned", card=args[1])
         if item.card.kind == KIND_AWAKENED:
-            return PluginResponse.ok(text="觉醒卡是专门画给你的，不能送人哦。")
+            return await self._reply(group_id, "gift_awakened")
         store.give(
             group_id=group_id,
             from_id=owner,
@@ -653,26 +741,26 @@ class GachaPlugin(PluginBase):
             card_id=item.card.card_id,
             now=_now().isoformat(),
         )
-        return PluginResponse.ok(text=self._line("gift_done", card=_label(item.card), to=target[1]))
+        return await self._reply(group_id, "gift_done", card=_label(item.card), to=target[1])
 
     async def _trade(self, group_id: str, args: list[str]) -> PluginResponse:
         args = [arg for arg in args if arg != "换"]
         if len(args) != 3:
-            return PluginResponse.ok(text="用法：/交换 <人> <我的编号> <他的编号>，比如 /交换 小红 17 32")
+            return await self._reply(group_id, "trade_usage", musts=[_USAGE["trade"]])
         target = self._person(group_id, args[0])
         if target is None:
-            return PluginResponse.ok(text=f"我不知道「{args[0]}」是群里的谁，换个名字或者直接 @ 他试试。")
+            return await self._reply(group_id, "who_unknown", name=args[0])
         owner = self._owner_id()
         if target[0] == owner:
-            return PluginResponse.ok(text="自己跟自己换？我看不懂，但我大受震撼。")
+            return await self._reply(group_id, "trade_self")
         give = self._find_owned(group_id, owner, args[1])
         if give is None:
-            return PluginResponse.ok(text=f"你手里没有 {args[1]} 这张卡。")
+            return await self._reply(group_id, "not_owned", card=args[1])
         want = self._find_owned(group_id, target[0], args[2])
         if want is None:
-            return PluginResponse.ok(text=f"{target[1]} 手里没有 {args[2]} 这张卡。")
+            return await self._reply(group_id, "target_not_owned", who=target[1], card=args[2])
         if KIND_AWAKENED in {give.card.kind, want.card.kind}:
-            return PluginResponse.ok(text="觉醒卡是专门画给收藏者的，不能拿来换。")
+            return await self._reply(group_id, "trade_awakened")
         self._gacha().offer(
             group_id=group_id,
             from_id=owner,
@@ -683,93 +771,117 @@ class GachaPlugin(PluginBase):
             now=_now().isoformat(),
         )
         minutes = int(_OFFER_TTL.total_seconds() // 60)
-        said = self._line(
+        # 怎么同意是规则：请她说清楚，漏了由系统补上。
+        how = must(
+            f"{target[1]}，{minutes} 分钟内发 /同意交换 或 /拒绝交换",
+            "/同意交换",
+            "/拒绝交换",
+            f"{minutes} 分钟",
+            block=True,
+        )
+        return await self._reply(
+            group_id,
             "trade_offer",
+            musts=[how],
             who=self._speaker_name(),
             give=_label(give.card),
             to=target[1],
             want=_label(want.card),
         )
-        # 怎么同意由系统补上：这是规则，不交给台词本。
-        return PluginResponse.ok(text=f"{said}\n{target[1]}，{minutes} 分钟内发 /同意交换 或 /拒绝交换。")
 
     async def _accept(self, group_id: str, _args: list[str]) -> PluginResponse:
         store = self._gacha()
         offer = store.pending_offer(group_id, self._owner_id(), now=_now(), ttl=_OFFER_TTL)
         if offer is None:
-            return PluginResponse.ok(text="现在没有人要跟你换卡（或者已经过期了）。")
+            return await self._reply(group_id, "trade_none")
         give, want = store.card(group_id, offer.give_card), store.card(group_id, offer.want_card)
         if give is None or want is None or not store.swap(offer, _now().isoformat()):
-            return PluginResponse.ok(text=self._line("trade_failed"))
-        return PluginResponse.ok(
-            text=self._line("trade_done", who=offer.from_name, give=_label(give), want=_label(want))
+            return await self._reply(group_id, "trade_failed")
+        return await self._reply(
+            group_id, "trade_done", who=offer.from_name, give=_label(give), want=_label(want)
         )
 
     async def _reject(self, group_id: str, _args: list[str]) -> PluginResponse:
         store = self._gacha()
         offer = store.pending_offer(group_id, self._owner_id(), now=_now(), ttl=_OFFER_TTL)
         if offer is None:
-            return PluginResponse.ok(text="现在没有人要跟你换卡。")
+            return await self._reply(group_id, "trade_none")
         store.close_offer(offer.offer_id)
-        return PluginResponse.ok(text=self._line("trade_rejected", who=offer.from_name))
+        return await self._reply(group_id, "trade_rejected", who=offer.from_name)
 
     async def _star(self, group_id: str, args: list[str]) -> PluginResponse:
         if len(args) != 1:
-            return PluginResponse.ok(text="用法：/升星 <编号>，比如 /升星 17")
+            return await self._reply(group_id, "star_usage", musts=[_USAGE["star"]])
         owner = self._owner_id()
         item = self._find_owned(group_id, owner, args[0])
         if item is None:
-            return PluginResponse.ok(text=f"你手里没有 {args[0]} 这张卡。")
+            return await self._reply(group_id, "not_owned", card=args[0])
         if item.stars >= MAX_STARS:
-            return PluginResponse.ok(text=f"这张已经 {MAX_STARS} 星了，满了满了。可以试试 /觉醒。")
+            return await self._reply(
+                group_id,
+                "star_maxed",
+                facts=[f"满星是 {MAX_STARS} 星"],
+                musts=[must("满星的卡可以 /觉醒", "/觉醒")],
+                card=_label(item.card),
+            )
         if item.copies < 2:
-            return PluginResponse.ok(text="升星要用一张重复的卡，你这张只有一份。")
+            return await self._reply(group_id, "star_single")
         card = item.card
-        note = await self._say(
-            build_star_prompt(
-                owner=self._speaker_name(),
-                card_name=card.name,
-                title=card.title,
-                note=card.note,
-                stars=item.stars + 1,
-            ),
-            group_id,
+        note = parse_line(
+            await self._generate(
+                "（说一句）",
+                build_star_prompt(
+                    owner=self._speaker_name(),
+                    card_name=card.name,
+                    title=card.title,
+                    note=card.note,
+                    stars=item.stars + 1,
+                ),
+                group_id,
+            )
         )
         if not note:
             # 她没写成，就不扣卡：升星的意义就是这一句话。
-            return PluginResponse.ok(text="我一时没想好要写什么……等会儿再来升星吧，卡没扣。")
+            return await self._reply(group_id, "star_no_words")
         stars = self._gacha().star_up(
             group_id=group_id, owner_id=owner, card_id=card.card_id, note=note
         )
         if not stars:
-            return PluginResponse.ok(text="升星没成功，卡没扣，再试一次吧。")
+            return await self._reply(group_id, "star_failed")
         upgraded = self._gacha().owned(group_id, owner, card.card_id)
-        return self._image(
-            f"{card.label} 升到 {stars} 星！我在你那张上多写了一句：{note}",
-            await self._render(card, upgraded),
+        text = await self._speak(
+            "star_done",
+            group_id=group_id,
+            musts=[must(f"悄悄话：{note}", note)],
+            card=card.label,
+            stars=stars,
+            note=note,
         )
+        return self._image(text, await self._render(card, upgraded))
 
     # ── 觉醒：三星卡变成她专门画的超级卡 ──────────────────────────────
 
     async def _awaken(self, group_id: str, args: list[str]) -> PluginResponse:
         if len(args) != 1:
-            return PluginResponse.ok(text="用法：/觉醒 <编号>，比如 /觉醒 17")
+            return await self._reply(group_id, "awaken_usage", musts=[_USAGE["awaken"]])
         if self._option("art_per_day", 3, low=0, high=50) <= 0:
-            return PluginResponse.ok(text="我现在不画插画，觉醒先等等吧。")
+            return await self._reply(group_id, "awaken_off")
         owner = self._owner_id()
         store = self._gacha()
         item = self._find_owned(group_id, owner, args[0])
         if item is None:
-            return PluginResponse.ok(text=f"你手里没有 {args[0]} 这张卡。")
+            return await self._reply(group_id, "not_owned", card=args[0])
         card = item.card
         if card.kind not in {KIND_MEMBER, KIND_MOOD}:
-            return PluginResponse.ok(text="只有人物卡能觉醒。")
+            return await self._reply(group_id, "awaken_not_person")
         if item.stars < MAX_STARS:
-            return PluginResponse.ok(text=f"要先升到 {MAX_STARS} 星才能觉醒，这张现在 {item.stars} 星。")
+            return await self._reply(
+                group_id, "awaken_need_stars", need=MAX_STARS, stars=item.stars
+            )
         if store.awakened_from(group_id, owner, card.card_id) is not None:
-            return PluginResponse.ok(text="这张已经觉醒过了，觉醒卡就在你的图鉴里。")
+            return await self._reply(group_id, "awaken_already")
         if store.pending_art_job(group_id, owner, card.card_id):
-            return PluginResponse.ok(text="我还在画呢，别催～画好了叫你。")
+            return await self._reply(group_id, "awaken_busy")
         store.add_art_job(
             group_id=group_id,
             kind=KIND_AWAKENED,
@@ -778,7 +890,7 @@ class GachaPlugin(PluginBase):
             owner_name=self._speaker_name(),
             now=_now().isoformat(),
         )
-        return PluginResponse.ok(text=self._line("awaken_start", card=_label(card)))
+        return await self._reply(group_id, "awaken_start", card=_label(card))
 
     # ── 后台：慢慢给大家画卡、画插画、写台词本 ────────────────────────
 
@@ -992,10 +1104,17 @@ class GachaPlugin(PluginBase):
             if store.art_job_tried(job["job_id"]) >= _ART_MAX_ATTEMPTS:
                 store.finish_art_job(job["job_id"], "failed")
                 if job["kind"] == KIND_AWAKENED:
+                    text = await self._speak(
+                        "art_failed",
+                        group_id=job["group_id"],
+                        proactive=True,
+                        musts=[must("过一会儿可以再 /觉醒 一次", "/觉醒")],
+                        who=job["owner_name"] or "你",
+                        card=_label(base),
+                    )
                     await self.ctx.dispatch_proactive_message(
                         group_id=job["group_id"],
-                        text=f"{job['owner_name']}，{_label(base)} 的觉醒插画我画了两次都没画好……"
-                        "过一会儿再 /觉醒 一次吧，什么都没扣。",
+                        text=text,
                         event_id=f"gacha-art-failed:{job['job_id']}",
                     )
             return False
@@ -1055,18 +1174,23 @@ class GachaPlugin(PluginBase):
         self._save_art(card, art, likeness=drew_likeness)
         store.grant(group_id=group_id, owner_id=job["owner_id"], card_id=card.card_id, now=now)
         card = store.card(group_id, card.card_id) or card
-        said = await self._say(
-            build_reaction_prompt(
-                drawer=job["owner_name"] or "他",
-                card_name=card.name,
-                title=card.title,
-                rarity=SSR,
-            ),
-            group_id,
-        )
-        line = said or f"{job['owner_name']}，你的觉醒卡画好了：「{card.title}」。"
+        facts = [f"你写给他的话是「{card.note}」"] if card.note else []
+        musts = []
         if note:
-            line += f"（这次没能照 {base.subject_name} 本人的样子画：{note}，先用象征物代替。）"
+            # 没照本人画成、又不是他自己的选择：如实告诉大家。
+            facts.append(f"这次没能照 {base.subject_name} 本人的样子画（{note}），先用了象征物")
+            musts.append(must(f"这次没能照 {base.subject_name} 本人的样子画：{note}，先用象征物代替", note))
+        elif drew_likeness:
+            facts.append(f"这张插画是照 {base.subject_name} 本人登记的样子画的")
+        line = await self._speak(
+            "awaken_ready",
+            group_id=group_id,
+            proactive=True,
+            facts=facts,
+            musts=musts,
+            who=job["owner_name"] or "你",
+            title=card.title,
+        )
         await self._announce(
             group_id, line, card, store.owned(group_id, job["owner_id"], card.card_id)
         )
@@ -1086,7 +1210,16 @@ class GachaPlugin(PluginBase):
         art = await self._paint_art(scene)
         self._save_art(card, art)
         card = self._gacha().card(group_id, card.card_id) or card
-        await self._announce(group_id, f"名场面「{card.title}」入卡池了，限量 {card.supply} 份。", card, None)
+        text = await self._speak(
+            "moment_ready",
+            group_id=group_id,
+            proactive=True,
+            facts=[f"卡上引用的原话是「{card.quote}」"] if card.quote else [],
+            musts=[must(f"限量 {card.supply} 份", f"{card.supply} 份")],
+            title=card.title,
+            supply=card.supply,
+        )
+        await self._announce(group_id, text, card, None)
         return True
 
     async def _paint_art(self, scene: str) -> bytes:
@@ -1169,16 +1302,72 @@ class GachaPlugin(PluginBase):
             return ""
         return str(reply or "")
 
-    async def _say(self, system: str, group_id: str = "") -> str:
-        """让她现场说一句话。失败就是空串。"""
-        return parse_line(await self._generate("（说一句）", system, group_id))
+    async def _speak(
+        self,
+        occasion: str,
+        *,
+        group_id: str = "",
+        facts: Sequence[str] = (),
+        musts: Sequence[Must] = (),
+        also: Sequence[str] = (),
+        tail: str = "",
+        proactive: bool = False,
+        **values: Any,
+    ) -> str:
+        """她在这个场合开口：现场说，说不出来就用台词本；漏掉的规则由系统补上。
+
+        ``also`` 是只在兜底时追加的台词本场合（现场说时这些事已经写进 ``facts``）；
+        ``tail`` 是不交给她的整段规则（比如指令列表），总是另起一行接在最后。
+        """
+        line = ""
+        if self._live_voice():
+            system, user = build_live_prompt(
+                occasion,
+                values,
+                speaker="" if proactive else self._speaker_name(),
+                command="" if proactive else self._command_text(),
+                facts=facts,
+                musts=musts,
+                recent=list(self._recent.get(group_id, ())),
+                mood=self._mood(),
+                proactive=proactive,
+            )
+            try:
+                reply = await asyncio.wait_for(
+                    self._generate(user, system, group_id), _LIVE_TIMEOUT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                self.logger.info("图鉴现场说话超时，改用台词本")
+                reply = ""
+            line = parse_live(reply)
+            if line:
+                self._recent.setdefault(group_id, deque(maxlen=RECENT_LINES)).append(line)
+        if not line:
+            script = self._script()
+            line = script.say(occasion, self._rng, **values)
+            line += "".join(script.say(extra, self._rng) for extra in also)
+        line = finish(line, musts)
+        return f"{line}\n{tail}" if tail else line
+
+    def _live_voice(self) -> bool:
+        value = self.ctx.config.get("live_voice", True)
+        if isinstance(value, str):
+            return value.strip().lower() not in {"false", "0", "no", "off", ""}
+        return bool(value)
+
+    def _command_text(self) -> str:
+        message = getattr(self.ctx, "message", None)
+        return str(getattr(message, "content", "") or "").strip()
+
+    def _mood(self) -> str:
+        emotion = getattr(self.ctx.engine.get_engine(), "assistant_emotion", None)
+        try:
+            return mood_words(float(getattr(emotion, "valence", 0.2)))
+        except (TypeError, ValueError):
+            return ""
 
     def _script(self) -> Script:
         return Script.from_dict(self.get_data_store().get("script"))
-
-    def _line(self, occasion: str, **values: Any) -> str:
-        """常说的话：从她的台词本里挑一句；她还没写的场合用保底句。"""
-        return self._script().say(occasion, self._rng, **values)
 
     async def _refresh_script(self) -> None:
         """台词本一周一换；写失败了当天不再重试。"""
@@ -1299,6 +1488,19 @@ class GachaPlugin(PluginBase):
             message_group=MessageGroup([TextSegment(text), image]),
             render_mode="direct",
         )
+
+
+def _when(schedule: Schedule) -> dict[str, str]:
+    return {"times": format_times(schedule.times), "next": describe_next(schedule, _now())}
+
+
+def _schedule_musts(schedule: Schedule) -> list[Must]:
+    """刷新时刻是规则：每个时刻、下一次是什么时候都要说对。"""
+    when = _when(schedule)
+    return [
+        must(f"每天 {when['times']} 刷新", *(f"{m // 60:02d}:{m % 60:02d}" for m in schedule.times)),
+        must(f"下次是 {when['next']}", when["next"]),
+    ]
 
 
 def _label(card: Card) -> str:

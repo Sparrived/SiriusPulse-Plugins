@@ -42,6 +42,8 @@ from sirius_pulse.plugins.loader import PluginLoader
 from sirius_pulse.plugins.registry import PluginRegistry
 from sirius_pulse.visual import VisualService, policies
 
+from plugins.gacha.voice import LIVE_MARK
+
 GROUP = "730101"
 #: 适配器配置里的 root：阿明的 QQ 号。
 ROOT_QQ = "10001"
@@ -89,7 +91,8 @@ class Engine:
         self.prompts: list[str] = []
         self.tasks: list[str] = []
         self.replies: list[str] = []  # 写卡、判断名场面、觉醒（JSON）
-        self.lines: list[str] = []  # 她说的一句话（抽到好卡的反应、升星、插画画面）
+        self.lines: list[str] = []  # 她写在卡上的一句话（升星悄悄话、插画画面）
+        self.voice: list[str] = []  # 她现场开口回大家的话（每条指令的回复、画好时叫人）
         self.script = ""  # 她写的台词本
         self.events: list[tuple[str, str, float, float]] = []
         self.paintings: list = []  # 生图请求
@@ -174,6 +177,8 @@ class Engine:
         self.tasks.append(task_name)
         if "【写你的台词本】" in system_prompt:
             return self.script
+        if LIVE_MARK in system_prompt:
+            return self.voice.pop(0) if self.voice else ""
         if "只输出一个 JSON" in system_prompt:
             return self.replies.pop(0) if self.replies else card_reply()
         return self.lines.pop(0) if self.lines else ""
@@ -361,12 +366,14 @@ async def test_first_draw_paints_the_most_active_member_from_this_group_only(cha
 
     await chat.send("/抽卡")
 
-    assert len(chat.engine.prompts) == 1, "第一次抽卡只当场画一张"
-    prompt = chat.engine.prompts[0]
+    # 第一次抽卡：当场画一张卡，再现场说一句。
+    assert len(chat.engine.prompts) == 2
+    prompt, spoken = chat.engine.prompts
     assert "阿明" in prompt and "明天一定早睡" in prompt
     assert "跳槽" not in prompt and "怕黑" not in prompt and "/抽卡" not in prompt
-    # 卡面走她平时说话的那条生成链路：人设、说话方式由宿主注入，和聊天时一样。
-    assert chat.engine.tasks == ["plugin_generate"]
+    assert LIVE_MARK in spoken and "跳槽" not in spoken and "怕黑" not in spoken
+    # 卡面和她说的话都走她平时说话的那条生成链路：人设、说话方式由宿主注入，和聊天时一样。
+    assert chat.engine.tasks == ["plugin_generate", "plugin_generate"]
     assert "用你自己平时说话的方式" in prompt
     # 回复里既有她的台词也有卡面，台词随图一起真正发到群里。
     assert "阿明" in chat.said() and "凌晨三点的哲学家" in chat.said()
@@ -484,8 +491,9 @@ async def test_a_garbled_card_is_never_issued(chat):
 
 @pytest.mark.asyncio
 async def test_private_chat_cannot_play(chat):
-    await chat.send("/抽卡", group_id="private_10002")
-    assert chat.engine.prompts == [] and chat.sent == []
+    reply = await chat.send("/抽卡", group_id="private_10002")
+    assert "群里" in reply and chat.sent == []
+    assert all(LIVE_MARK in prompt for prompt in chat.engine.prompts), "私聊里不画卡"
 
 
 # --- 后台画卡 -------------------------------------------------------------------
@@ -734,9 +742,10 @@ async def test_in_a_good_mood_she_paints_a_mood_card_once_a_day_and_luck_goes_up
     # 心情回落后，抽到 SR 时她会亲口说一句。
     chat.engine.assistant_emotion.valence = 0.2
     chat.rng = _Always()
-    chat.engine.lines = ["你抽到了我心情最好的那张！"]
+    chat.engine.voice = ["你抽到了我心情最好的那张！"]
     await chat.send("/抽卡", user="u-hong")
-    assert chat.said().startswith("你抽到了我心情最好的那张"), "SR 以上她现场说，不用模板"
+    assert chat.said().startswith("你抽到了我心情最好的那张"), "她现场说，不用模板"
+    assert "SR" in chat.engine.prompts[-1], "她知道这张很难得"
     assert "心情好，手气" not in chat.said()
 
 
@@ -843,11 +852,12 @@ def _scripts(chat) -> int:
 
 
 @pytest.mark.asyncio
-async def test_everyday_lines_come_from_the_script_she_writes_each_week(chat):
+async def test_when_she_cannot_speak_live_her_weekly_script_fills_in(chat):
     chat.engine.script = script_reply(
         draw_new=["诶嘿，{name}来啦——「{title}」！", "这句少了占位符"],
         drawn_out=["{nope}今天不行"],
     )
+    # 这个测试里她现场开不了口（模型没回话），才轮到台词本。
     plugin = await _open(chat)  # 她还没写台词本：先用保底句
     assert "抽到了" in chat.said()
 
@@ -877,6 +887,54 @@ async def test_a_script_she_could_not_write_is_not_retried_the_same_day(chat):
     chat.clock[0] += timedelta(days=1)
     await plugin.mint_beat()
     assert _scripts(chat) == 2
+
+
+# --- 她的声音：每句回复都现场说 ------------------------------------------------------
+
+
+def _spoken(chat) -> list[str]:
+    """她现场开口的那几次调用。"""
+    return [prompt for prompt in chat.engine.prompts if LIVE_MARK in prompt]
+
+
+@pytest.mark.asyncio
+async def test_every_reply_is_said_live_in_her_own_words_and_rules_are_never_lost(chat):
+    chat.engine.assistant_emotion.valence = 0.5
+    await _open(chat)  # 新来的群友抽了这一轮的那一次
+
+    chat.engine.voice = ["哼哼，这轮你已经抽完啦，乖乖等着吧"]
+    await chat.send("/抽卡", user="u-new")
+    assert chat.said().startswith("哼哼，这轮你已经抽完啦"), "是她现场说的，不是模板"
+    assert "（下次刷新：明天 00:00）" in chat.said(), "她没说到的刷新时间由系统补上"
+    prompt = _spoken(chat)[-1]
+    assert "新来的" in prompt and "/抽卡" in prompt, "她知道是谁、发了什么"
+    assert "用完" in prompt and "下次刷新：明天 00:00" in prompt
+    assert "很好" in prompt, "她此刻的心情也带进去"
+
+    chat.engine.voice = ["说了等明天 00:00 嘛，急什么"]
+    await chat.send("/抽卡", user="u-new")
+    assert chat.said().startswith("说了等明天 00:00 嘛") and "（下次刷新" not in chat.said()
+    assert "哼哼，这轮你已经抽完啦" in _spoken(chat)[-1], "她记得刚说过什么，会换个说法"
+
+    # 指令写错：她自己说，用法由系统整段接在后面。
+    chat.engine.voice = ["送谁？送哪张？你得告诉我呀"]
+    await chat.send("/送卡 小红", user="u-wang")
+    assert chat.said().startswith("送谁？") and "/送卡 小红 17" in chat.said()
+
+    # 帮助：她先说一句，指令列表照旧完整给出。
+    chat.engine.voice = ["想玩图鉴？我教你～"]
+    await chat.send("/抽卡 帮助", user="u-wang")
+    assert chat.said().startswith("想玩图鉴？") and "/升星 <编号>" in chat.said()
+
+
+@pytest.mark.asyncio
+async def test_with_live_voice_off_she_only_uses_her_script(chat):
+    plugin = await chat.plugin()
+    plugin.ctx.config["live_voice"] = False
+    await _open(chat)
+    await chat.send("/抽卡", user="u-new")
+    assert "这一轮已经抽过" in chat.said() and "下次刷新" in chat.said()
+    assert not _spoken(chat), "关掉现场说话就不为说话调用模型"
 
 
 # --- 超级卡：觉醒与插画 -----------------------------------------------------------
@@ -916,7 +974,7 @@ async def test_a_three_star_card_awakens_into_an_ssr_she_paints_just_for_you(cha
     assert "还在画" in chat.said()
 
     chat.engine.replies = [awaken_reply()]
-    chat.engine.lines = ["小红！你的觉醒卡画好啦！"]
+    chat.engine.voice = ["小红！你的觉醒卡画好啦！"]
     assert await plugin.art_beat() is True
 
     [painting] = chat.engine.paintings

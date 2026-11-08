@@ -172,15 +172,6 @@ def parse_moment(text: str, *, line_count: int) -> MomentText | None:
 MAX_LINE = 40
 
 
-def build_reaction_prompt(*, drawer: str, card_name: str, title: str, rarity: str) -> str:
-    return (
-        "【抽卡现场】\n"
-        f"群友「{drawer}」刚在群友图鉴里抽到了你画的 {rarity} 卡：{card_name}「{title}」。"
-        f"像你平时在群里说话那样，对他说一句反应，{MAX_LINE} 字以内。"
-        "只输出这句话本身，不要引号、不要解释。\n\n" + _SAFETY
-    )
-
-
 def build_star_prompt(*, owner: str, card_name: str, title: str, note: str, stars: int) -> str:
     return (
         "【升星】\n"
