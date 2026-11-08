@@ -659,7 +659,13 @@ def _minutes(ts: int) -> int:
 
 
 def speaker_names(messages: Iterable[Msg]) -> list[str]:
-    return list(dict.fromkeys(m.name for m in messages if m.name))
+    """说过话的人和被 @ 到的人的名字：话题泡泡里不该出现人名。"""
+    names: list[str] = []
+    for msg in messages:
+        if msg.name:
+            names.append(msg.name)
+        names.extend(msg.mention_names)
+    return list(dict.fromkeys(names))
 
 
 def _delta(now: int, before: int | None) -> float | None:
@@ -676,6 +682,108 @@ def _session_dict(session: Session, people: dict[str, Person]) -> dict[str, Any]
         "count": session.count,
         "people": [uid for uid in session.people if uid in people][:5],
         "keywords": session.keywords,
+    }
+
+
+DAYPARTS = (("凌晨", 0, 6), ("上午", 6, 12), ("下午", 12, 18), ("晚上", 18, 24))
+
+
+def extras(
+    messages: Sequence[Msg],
+    people: dict[str, Person],
+    all_sessions: Sequence[Session],
+    scores: Counter,
+    keywords: Sequence[tuple[str, int]],
+) -> dict[str, Any]:
+    """卡片底部那一行小统计用的口径：时段分布、首末发言、笑声、互动、人群结构、节奏。"""
+    humans = [m for m in messages if not m.is_bot]
+    total = len(humans) or 1
+
+    hours = hourly(messages)
+    dayparts = [
+        {"label": label, "count": sum(hours[lo:hi]), "share": sum(hours[lo:hi]) / total}
+        for label, lo, hi in DAYPARTS
+    ]
+    first = humans[0] if humans else None
+    last = humans[-1] if humans else None
+
+    laughers = Counter(m.uid for m in humans if m.is_chat_text and is_laugh(m.text))
+    laugh_hours = Counter(m.hour for m in humans if m.is_chat_text and is_laugh(m.text))
+    texts = sum(1 for m in humans if m.is_chat_text) or 1
+
+    partners: dict[str, set[str]] = defaultdict(set)
+    for a, b in scores:
+        partners[a].add(b)
+        partners[b].add(a)
+    hub = max(
+        (uid for uid in partners if uid in people),
+        key=lambda uid: (len(partners[uid]), people[uid].count),
+        default="",
+    )
+    gaps = sorted(
+        b.ts - a.ts
+        for a, b in zip(humans, humans[1:])
+        if a.uid != b.uid and 0 <= b.ts - a.ts <= 300
+    )
+
+    counts = sorted((p.count for p in people.values()), reverse=True)
+    silence = {"minutes": 0, "start": 0, "end": 0}
+    for a, b in zip(humans, humans[1:]):
+        minutes = (b.ts - a.ts) // 60
+        if minutes > silence["minutes"]:
+            silence = {"minutes": minutes, "start": a.ts, "end": b.ts}
+    longest = max(all_sessions, key=lambda s: s.end - s.start, default=None)
+
+    # 她自己的今天：说了几句、接了谁的话、什么时候最活跃
+    answered: Counter = Counter()
+    her_hours: Counter = Counter()
+    previous_human: Msg | None = None
+    for msg in messages:
+        if msg.is_bot:
+            her_hours[msg.hour] += 1
+            if previous_human is not None and 0 <= msg.ts - previous_human.ts <= 120:
+                answered[previous_human.uid] += 1
+        else:
+            previous_human = msg
+    favorite = next((uid for uid, _ in answered.most_common() if uid in people), "")
+
+    return {
+        "her": {
+            "count": sum(her_hours.values()),
+            "answered_people": len([uid for uid in answered if uid in people]),
+            "favorite_uid": favorite,
+            "favorite_count": answered.get(favorite, 0),
+            "peak_hour": her_hours.most_common(1)[0][0] if her_hours else None,
+        },
+        "dayparts": dayparts,
+        "first": {"ts": first.ts, "uid": first.uid, "name": first.name} if first else None,
+        "last": {"ts": last.ts, "uid": last.uid, "name": last.name} if last else None,
+        "laugh_stats": {
+            "total": sum(laughers.values()),
+            "share": sum(laughers.values()) / texts,
+            "top_uid": laughers.most_common(1)[0][0] if laughers else "",
+            "top_count": laughers.most_common(1)[0][1] if laughers else 0,
+            "peak_hour": laugh_hours.most_common(1)[0][0] if laugh_hours else None,
+        },
+        "social": {
+            "links": sum(scores.values()),
+            "hub_uid": hub,
+            "hub_partners": len(partners.get(hub, ())),
+            "mentions": sum(len(m.mentions) for m in humans),
+            "reply_median": gaps[len(gaps) // 2] if gaps else None,
+        },
+        "crowd": {
+            "top3_share": sum(counts[:3]) / total if counts else 0.0,
+            "average": total / len(counts) if counts else 0.0,
+            "passers": sum(1 for c in counts if c <= 2),
+            "chars_per_msg": sum(len(m.text) for m in humans if m.is_chat_text) / texts,
+        },
+        "rhythm": {
+            "sessions": len(all_sessions),
+            "longest_minutes": (longest.end - longest.start) // 60 if longest else 0,
+            "silence": silence,
+        },
+        "more_words": [word for word, _ in keywords[12:20]],
     }
 
 
@@ -702,7 +810,9 @@ def build_day(
         (m.text for m in humans if m.is_chat_text), blocked=blocked, names=names
     )
     ranking = sorted(people.values(), key=lambda p: (-p.count, p.uid))
+    scores = pair_scores(messages)
     return {
+        **extras(messages, people, all_sessions, scores, keywords),
         "kind": "day",
         "start": int(start.timestamp()),
         "end": int(end.timestamp()),
@@ -718,10 +828,10 @@ def build_day(
         "peak": {"start": peak_start, "count": peak_count},
         "people": people,
         "ranking": [p.uid for p in ranking],
-        "awards": awards(people),
-        "laughs": laugh_moments(messages),
-        "echoes": echoes(messages),
-        "pairs": top_pairs(pair_scores(messages), people),
+        "awards": awards(people, limit=8),
+        "laughs": laugh_moments(messages, top=4),
+        "echoes": echoes(messages, top=3),
+        "pairs": top_pairs(scores, people, top=4),
         "keywords": keywords,
         "sessions": [_session_dict(s, people) for s in top_sessions],
         "session_objs": top_sessions,
@@ -747,7 +857,8 @@ def build_week(
     previous_humans = [m for m in previous if not m.is_bot]
     report["previous_count"] = len(previous_humans) if previous else None
     report["delta"] = _delta(len(humans), len(previous_humans) if previous else None)
-    report["awards"] = awards(report["people"], weekly=True)
+    report["awards"] = awards(report["people"], weekly=True, limit=8)
+    report["pairs"] = top_pairs(pair_scores(messages), report["people"], top=5)
 
     # 一周天气预报
     by_day: dict[str, list[Msg]] = defaultdict(list)
@@ -777,6 +888,17 @@ def build_week(
     for msg in humans:
         grid[msg.local.weekday()][msg.hour] += 1
     report["grid"] = grid
+    weekday_counts = [d["count"] for d in days if d["weekday"] < 5]
+    weekend_counts = [d["count"] for d in days if d["weekday"] >= 5]
+    hot_day, hot_hour = max(
+        ((r, h) for r in range(7) for h in range(24)), key=lambda rh: grid[rh[0]][rh[1]]
+    )
+    report["week_rhythm"] = {
+        "weekday_avg": sum(weekday_counts) / len(weekday_counts) if weekday_counts else 0.0,
+        "weekend_avg": sum(weekend_counts) / len(weekend_counts) if weekend_counts else 0.0,
+        "hot_slot": {"weekday": hot_day, "hour": hot_hour, "count": grid[hot_day][hot_hour]},
+        "active_days": sum(1 for d in days if d["count"] > 0),
+    }
 
     people = report["people"]
     active_days = len([d for d in days if d["count"] > 0]) or 1

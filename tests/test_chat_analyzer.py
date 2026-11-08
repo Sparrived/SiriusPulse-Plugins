@@ -46,7 +46,13 @@ _CN = timezone(timedelta(hours=8))
 #: 测试里的「现在」：周日晚上 22:30（周报默认周日 21:30、日报默认 22:00）
 NOW = datetime(2026, 11, 8, 22, 30, tzinfo=_CN)
 
-PEOPLE = [("10001", "小明"), ("10002", "阿离"), ("10003", "雀雀"), ("10004", "糖糖")]
+PEOPLE = [
+    ("10001", "小明"),
+    ("10002", "阿离"),
+    ("10003", "雀雀"),
+    ("10004", "糖糖"),
+    ("10005", "BOT yuki"),
+]
 
 
 def _png(color=(90, 80, 160)) -> bytes:
@@ -95,6 +101,14 @@ def seed_lively(store: BasicMemoryFileStore, group_id: str, day: datetime) -> No
         ("10004", "可乐要冰的"),
         ("10001", "烧烤摊老板认识我"),
         ("10002", "那必须打折"),
+        ("10003", "戳了一下 qq_10004"),
+        ("10004", "戳了一下 qq_10003"),
+        ("10001", "戳了一下 qq_10003"),
+        ("10002", "[图片]"),
+        ("10003", "[图片]"),
+        ("10004", "[图片]"),
+        ("10001", '[引用消息 msg_id="9" speaker="阿离"]那必须打折[/引用消息]幽夜也来吗'),
+        ("10005", "@糖糖(群昵称为糖糖（幽夜开发）) 烧烤带我一个"),
     ]
     seq = 0
     for round_ in range(3):
@@ -141,6 +155,7 @@ class Engine:
         )
         self.prompts: list[str] = []
         self.image_prompts: list[str] = []
+        self.image_requests: list = []
         self.writing: str | None = None
         self.brain = SimpleNamespace(
             generate_text=self._generate, generate_image_async=self._paint, persona_assets_dir=None
@@ -155,11 +170,16 @@ class Engine:
         ids = re.findall(r"【第 (\d+) 段】", prompt)
         return json.dumps(
             {
-                "headline": "今晚大家约了烧烤，<b>小明</b>说要请客～",
+                "headline": "今晚大家约了烧烤，<b><@10001></b>说要请客～",
                 "chapters": [
-                    {"id": int(i), "title": f"烧烤之约{i}", "summary": "大家约好下班去楼下烧烤摊。"} for i in ids
+                    {
+                        "id": int(i),
+                        "title": f"烧烤之约{i}",
+                        "summary": "<@10002> 问地方，大家约好下班去楼下烧烤摊。",
+                    }
+                    for i in ids
                 ],
-                "diary": "今天群里一直在聊烧烤，<img src=x>我也好想去。",
+                "diary": "今天群里一直在聊烧烤，<img src=x><@10003> 讲了煤球羊肉串，雀雀笑得最开心。",
                 "scene": "月白坐在烧烤摊边，手里拿着一串烤玉米，天上挂着月亮。",
             },
             ensure_ascii=False,
@@ -167,6 +187,7 @@ class Engine:
 
     async def _paint(self, request):
         self.image_prompts.append(request.prompt)
+        self.image_requests.append(request)
         return SimpleNamespace(image_bytes=_png((250, 200, 210)), mime_type="image/png")
 
     async def dispatch_proactive_message(self, **kwargs):
@@ -327,9 +348,38 @@ async def test_daily_page_shows_story_titles_awards_and_moments_but_not_her(rig)
     assert "冲冲冲" in html  # 复读
     assert "上次那家烧烤老板把羊肉串烤成了煤球" in html  # 引来笑声的那句
     assert "今日一画" in html  # 插画贴上了
+    # 卡片底部的小统计：时段分布、节奏、笑声、互动、人群结构、她自己的今天
+    for measure in ("上午", "成段的聊天", "接话的中位数", "最爱笑", "社交中心", "前三名说的", "第一句"):
+        assert measure in html, measure
+    assert "月白的今天" in html and "她说的话" in html
     ranking = html.split("冒泡排行", 1)[1]
     assert "月白</span>" not in ranking, "她自己不该进排行"
-    assert "<img src=x>" not in html and "<b>小明</b>" not in html
+    assert "<img src=x>" not in html and "<b>" not in html
+
+
+@pytest.mark.asyncio
+async def test_pokes_pictures_and_quotes_stay_out_of_echoes_and_bubbles(rig):
+    await rig.send("/ca daily")
+    html = rig.pages[0]
+    moments = html.split("笑点与复读", 1)[1].split("话题泡泡", 1)[0]
+    bubbles = html.split("话题泡泡", 1)[1].split("聊得来的两个人", 1)[0]
+
+    for noise in ("戳了一下", "[图片]", "引用消息", "speaker", "群昵称为"):
+        assert noise not in moments and noise not in bubbles, noise
+    assert "幽夜" not in bubbles, "被 @ 的人名不是话题"
+    assert "烧烤" in bubbles
+
+
+@pytest.mark.asyncio
+async def test_people_she_mentions_show_as_avatar_tags(rig):
+    await rig.send("/ca daily")
+    html = rig.pages[0]
+    diary = html.split("她的日记", 1)[1]
+
+    assert diary.count('class="tag"') >= 2  # <@10003> 和直接写出的「雀雀」
+    assert '<span class="tag"><img src="data:image/png;base64,' in diary
+    assert "&lt;@" not in html and "<@100" not in html
+    assert "小明说要请客" in rig.said()  # 发到群里的那句话是名字，不是标记
 
 
 @pytest.mark.asyncio
@@ -348,7 +398,7 @@ async def test_without_model_she_still_sends_a_factual_line(rig):
     await rig.send("/ca daily")
 
     assert len(rig.images()) == 1
-    assert "4 个人聊了" in rig.said()
+    assert "5 个人聊了" in rig.said()
     assert "她的日记" not in rig.pages[0]
 
 
@@ -372,8 +422,31 @@ async def test_illustration_is_reused_within_the_day(rig):
     await rig.send("/ca daily")
 
     assert len(rig.engine.image_prompts) == 1
-    assert "烤玉米" in rig.engine.image_prompts[0]
-    assert "不要出现任何文字" in rig.engine.image_prompts[0]
+    prompt = rig.engine.image_prompts[0]
+    assert "烤玉米" in prompt  # 她写的画面
+    assert "烧烤之约" in prompt  # 当天的章节一件件都要画进去
+    assert "不要出现任何文字" in prompt
+
+
+@pytest.mark.asyncio
+async def test_illustration_reuses_saved_partner_art_in_order(rig):
+    folder = rig.engine.work_path / "bot_assets"
+    (folder / "yuki").mkdir(parents=True)
+    (folder / "yuki" / "standing.png").write_bytes(_png((10, 20, 30)))
+    (folder / "nobody").mkdir()
+    (folder / "nobody" / "standing.png").write_bytes(_png())
+    (folder / "index.json").write_text(
+        json.dumps({"yuki": {"name": "yuki"}, "nobody": {"name": "没来过的人"}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    await rig.send("/ca daily")
+
+    request = rig.engine.image_requests[0]
+    assert [name for name, _ in request.reference_images] == ["standing.png"]
+    assert "第 1 张参考图是「yuki」" in request.prompt
+    assert "没来过的人" not in request.prompt
+    assert "yuki" in rig.engine.prompts[0]  # 她写画面时也知道 yuki 可以画进去
 
 
 @pytest.mark.asyncio

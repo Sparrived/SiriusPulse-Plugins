@@ -26,17 +26,27 @@ KIND_IMAGE = "image"
 KIND_STICKER = "sticker"
 KIND_COMMAND = "command"
 KIND_SHARE = "share"
+KIND_POKE = "poke"
 
-_STICKER_RE = re.compile(
-    r"^[\[【]\s*(?:动画表情|表情包|表情|超级表情|商城表情)\s*[:：]|\[CQ:(?:face|mface|marketface)",
-    re.IGNORECASE,
+#: 引用块与合并转发块：里面是别人的旧话，不算这条消息说的内容
+_QUOTE_BLOCK_RE = re.compile(r"\[引用消息[^\]]*\].*?(?:\[/引用消息\]|\Z)", re.S)
+_FORWARD_BLOCK_RE = re.compile(r"\[(?:嵌套)?合并转发[^\]]*\].*?(?:\[/合并转发\]|\Z)", re.S)
+#: 戳一戳（适配器写成「戳了一下 qq_123」「戳了一下 月白」）
+_POKE_RE = re.compile(r"^(?:戳了一下|戳了戳|拍了拍)\s*\S{0,40}$")
+#: 占位标记：[图片]、[图片："a.jpg"]、[表情]、[表情：微笑]、【动画表情：xx】、[语音]、[文件：x]……
+_MEDIA_RE = re.compile(
+    r"[\[【]\s*(图片描述|图片|闪照|截图|动画表情|表情包|超级表情|商城表情|表情|语音|视频|文件|网易云|QQ音乐|分享|链接|小程序|卡片)"
+    r"\s*(?:[:：][^\]】]*)?[\]】]"
 )
-_IMAGE_RE = re.compile(r"^[\[【]\s*(?:图片|闪照|截图)\s*[:：]|\[CQ:image", re.IGNORECASE)
-_SHARE_RE = re.compile(r"^[\[【]\s*(?:网易云|QQ音乐|分享|链接|小程序|卡片|视频|语音|文件)\s*[\]】:：]")
-#: 正文里夹带的占位标记：[图片: xx.jpg]、【动画表情：xx】、[CQ:...]
-_MARKER_RE = re.compile(r"[\[【][^\]】]{0,12}?[:：][^\]】]*[\]】]|\[CQ:[^\]]*\]")
+_CQ_RE = re.compile(r"\[CQ:([a-z]+)[^\]]*\]", re.I)
+_STICKER_KINDS = {"动画表情", "表情包", "超级表情", "商城表情", "表情", "face", "mface", "marketface"}
+_IMAGE_KINDS = {"图片", "闪照", "截图", "image"}
 _URL_RE = re.compile(r"https?://\S+")
-_MENTION_RE = re.compile(r"@([^\s@:：,，。!！?？()（）]{1,24})")
+#: @昵称 或 @昵称(群昵称为名片)
+_MENTION_RE = re.compile(
+    r"@(?:([^@\n()（）\[\]]{1,24}?)(?=[(（]群昵称为)|([^\s@:：,，。!！?？()（）\[\]]{1,24}))"
+    r"(?:[(（]群昵称为((?:[^()（）]|[(（][^()（）]*[)）]){1,40})[)）])?"
+)
 
 
 @dataclass(slots=True)
@@ -47,10 +57,11 @@ class Msg:
     uid: str
     name: str
     raw: str
-    text: str  # 去掉占位标记、链接、@ 之后的正文
+    text: str  # 去掉引用、占位标记、链接、@ 之后的正文
     kind: str
     is_bot: bool = False
     mentions: tuple[str, ...] = field(default_factory=tuple)  # 被 @ 的人（uid）
+    mention_names: tuple[str, ...] = field(default_factory=tuple)  # 被 @ 的人写在消息里的名字
 
     @property
     def local(self) -> datetime:
@@ -83,29 +94,46 @@ def parse_ts(value: Any) -> int:
     return int(dt.timestamp())
 
 
+def mention_names(raw: str) -> list[str]:
+    """消息里 @ 到的名字（昵称和群名片都算）。"""
+    names: list[str] = []
+    for match in _MENTION_RE.finditer(raw or ""):
+        nick = match.group(1) or match.group(2) or ""
+        names.extend(name.strip() for name in (nick, match.group(3)) if name and name.strip())
+    return names
+
+
 def classify(raw: str, multimodal: Iterable[Any] = ()) -> tuple[str, str]:
-    """认出消息是文字、图片、表情、指令还是分享，并给出去掉标记后的正文。"""
-    content = (raw or "").strip()
-    if _STICKER_RE.search(content):
-        return KIND_STICKER, ""
-    if _IMAGE_RE.search(content):
-        return KIND_IMAGE, _clean(content)
-    if _SHARE_RE.search(content):
+    """认出消息是文字、图片、表情、戳一戳、指令还是分享，并给出去掉标记后的正文。"""
+    content = _QUOTE_BLOCK_RE.sub(" ", (raw or "")).strip()
+    if _POKE_RE.match(content):
+        return KIND_POKE, ""
+    if content.startswith("[合并转发") or content.startswith("[嵌套合并转发"):
         return KIND_SHARE, ""
+    content = _FORWARD_BLOCK_RE.sub(" ", content).strip()
     if content[:1] in ("/", "#", "！", "!") and len(content) > 1 and not content[1:2].isspace():
         return KIND_COMMAND, ""
+    tokens = [m.group(1) for m in _MEDIA_RE.finditer(content)]
+    tokens += [m.group(1).lower() for m in _CQ_RE.finditer(content)]
     text = _clean(content)
+    if text:
+        return KIND_TEXT, text
     has_image = any(
         isinstance(item, dict) and str(item.get("type", "")).lower() == "image"
         for item in multimodal or ()
     )
-    if has_image and not text:
+    if any(token in _STICKER_KINDS for token in tokens):
+        return KIND_STICKER, ""
+    if any(token in _IMAGE_KINDS or token == "图片描述" for token in tokens) or has_image:
         return KIND_IMAGE, ""
-    return KIND_TEXT, text
+    if tokens:
+        return KIND_SHARE, ""
+    return KIND_TEXT, ""
 
 
 def _clean(content: str) -> str:
-    text = _MARKER_RE.sub(" ", content)
+    text = _MEDIA_RE.sub(" ", content)
+    text = _CQ_RE.sub(" ", text)
     text = _URL_RE.sub(" ", text)
     text = _MENTION_RE.sub(" ", text)
     return re.sub(r"\s+", " ", text).strip()
@@ -216,8 +244,12 @@ def normalize(entries: Iterable[Any], *, self_uid: str = "") -> list[Msg]:
         )
         raw = str(_field(entry, "content", "") or "")
         kind, text = classify(raw, _field(entry, "multimodal_inputs", []) or [])
+        if kind == KIND_POKE:
+            continue  # 戳一戳是动作不是聊天
         name = str(_field(entry, "speaker_name", "") or "").strip()
-        raw_messages.append((Msg(ts, uid, name, raw, text, kind, is_bot), raw))
+        msg = Msg(ts, uid, name, raw, text, kind, is_bot)
+        msg.mention_names = tuple(mention_names(_QUOTE_BLOCK_RE.sub(" ", raw)))
+        raw_messages.append((msg, raw))
 
     # @ 只认识群里真的说过话的人：按名字最长匹配到 uid
     names: dict[str, str] = {}
@@ -225,14 +257,13 @@ def normalize(entries: Iterable[Any], *, self_uid: str = "") -> list[Msg]:
         if msg.name and not msg.is_bot:
             names.setdefault(msg.name, msg.uid)
     ordered_names = sorted(names, key=len, reverse=True)
-    for msg, raw in raw_messages:
-        if "@" not in raw or not ordered_names:
+    for msg, _raw in raw_messages:
+        if not msg.mention_names or not ordered_names:
             continue
         hits: list[str] = []
-        for match in re.finditer(r"@", raw):
-            tail = raw[match.end() : match.end() + 26]
+        for written in msg.mention_names:
             for name in ordered_names:
-                if tail.startswith(name):
+                if written == name or written.startswith(name):
                     target = names[name]
                     if target != msg.uid and target not in hits:
                         hits.append(target)

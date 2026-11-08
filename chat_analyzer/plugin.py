@@ -29,7 +29,7 @@ from sirius_pulse.plugins.api import (
     group_command,
 )
 
-from . import avatars, metrics, page, source, writer
+from . import avatars, metrics, page, partners, source, writer
 from .source import CN_TZ
 
 logger = logging.getLogger(__name__)
@@ -599,6 +599,8 @@ class ChatAnalyzerPlugin(PluginBase):
         names = {m.uid: m.name for m in [*previous, *messages] if m.name and not m.is_bot}
         names.update({uid: p.name for uid, p in report["people"].items()})
         group_name = await self._group_name(group_id)
+        # 这一期出现过、又存了形象设定图的 AI 伙伴：可以画进今日一画
+        friends = partners.present_partners(engine, metrics.speaker_names(messages))
 
         writing_task = asyncio.create_task(
             self._write(
@@ -608,11 +610,20 @@ class ChatAnalyzerPlugin(PluginBase):
                 persona=persona,
                 window_label=window_label,
                 group_id=group_id,
+                partners=[friend.name for friend in friends],
             )
         )
         faces_task = asyncio.create_task(self._faces(report, self_uid))
         writing = await writing_task
-        art_uri = await self._art(kind, group_id, start, writing["scene"], persona, fresh=fresh_art)
+        art_uri = await self._art(
+            kind,
+            group_id,
+            start,
+            writer.image_prompt_inputs(report, writing),
+            persona,
+            friends,
+            fresh=fresh_art,
+        )
         faces = await faces_task
 
         view = {
@@ -642,7 +653,7 @@ class ChatAnalyzerPlugin(PluginBase):
         return {
             "report": report,
             "png": png,
-            "say": writing["headline"],
+            "say": writer.plain(writing["headline"], names),
             "text": self._text_version(report, names),
         }
 
@@ -675,6 +686,7 @@ class ChatAnalyzerPlugin(PluginBase):
         wanted += [uid for s in report["sessions"] for uid in s["people"]]
         wanted += report.get("regulars", []) + report.get("newcomers", [])
         wanted += (report.get("constellation") or {}).get("stars", [])
+        wanted += writer.mentionable(report)
         if self_uid:
             wanted.append(self_uid)
         try:
@@ -699,10 +711,21 @@ class ChatAnalyzerPlugin(PluginBase):
         return True
 
     async def _art(
-        self, kind: str, group_id: str, start: datetime, scene: str, persona: str, *, fresh: bool
+        self,
+        kind: str,
+        group_id: str,
+        start: datetime,
+        inputs: dict[str, Any],
+        persona: str,
+        friends: list[partners.Partner],
+        *,
+        fresh: bool,
     ) -> str:
-        """拿一张插画（data URI）。同一群同一周期画过就复用；定时那次会重画最新的。"""
-        if not self._option("illustration", True) or not scene:
+        """拿一张插画（data URI）。同一群同一周期画过就复用；定时那次会重画最新的。
+
+        参考图顺序固定：先是她自己的形象图，再是这一期出现过的伙伴；提示词里按同样的顺序说明谁是谁。
+        """
+        if not self._option("illustration", True) or not inputs.get("scene"):
             return ""
         try:
             folder = self.get_artifact_dir() / "art"
@@ -715,11 +738,21 @@ class ChatAnalyzerPlugin(PluginBase):
         async with self._art_lock:
             if not self._take_art_quota():
                 return avatars.data_uri(cache.read_bytes()) if cache.is_file() else ""
-            references = self.ctx.engine.get_persona_reference_images(limit=2)
+            own = self.ctx.engine.get_persona_reference_images(limit=2)
+            loaded = partners.read_references(friends)
+            references = [*own, *(image for _name, image in loaded)]
+            prompt = writer.image_prompt(
+                inputs["scene"],
+                persona=persona,
+                persona_refs=len(own),
+                partners=[name for name, _image in loaded],
+                story=inputs["story"],
+                weather=inputs["weather"],
+            )
             try:
                 result = await asyncio.wait_for(
                     self.ctx.engine.generate_image(
-                        writer.image_prompt(scene, persona=persona, has_reference=bool(references)),
+                        prompt,
                         reference_images=references,
                         timeout_seconds=_ART_TIMEOUT,
                     ),

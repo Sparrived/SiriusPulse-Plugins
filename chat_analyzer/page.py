@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import re
 from datetime import datetime
 from functools import lru_cache
 from importlib.resources import files
@@ -37,6 +38,7 @@ from .art import (
 )
 from .metrics import WEATHERS, fmt_clock
 from .source import CN_TZ
+from .writer import MENTION_RE
 
 logger = logging.getLogger(__name__)
 
@@ -180,8 +182,20 @@ body{width:%(width)dpx;background:#FFF9F1;color:%(ink)s;
 .rank .r .bar{flex:1;height:12px;border-radius:0 6px 6px 0;background:#F7F0F3;position:relative}
 .rank .r .bar i{position:absolute;left:0;top:0;bottom:0;border-radius:0 6px 6px 0}
 .rank .r .v{width:44px;text-align:right;color:%(sub)s;font-variant-numeric:tabular-nums}
-.diary .lines{font-size:16px;line-height:32px;white-space:pre-wrap;
-  background-image:linear-gradient(transparent 30px,#F3E1E6 30px,#F3E1E6 32px);background-size:100%% 32px}
+.tag{display:inline-flex;align-items:center;gap:4px;vertical-align:middle;margin:0 2px;padding:1px 9px 1px 2px;
+  border-radius:999px;background:#FDE7EC;color:#B9405D;font-size:.88em;font-weight:700;line-height:1.5}
+.tag img{width:1.45em;height:1.45em;border-radius:50%%;object-fit:cover;background:#FFFFFF}
+.diary .lines{flex:1;min-height:108px;font-size:18px;line-height:36px;white-space:pre-wrap;
+  background-image:linear-gradient(transparent 34px,#F3E1E6 34px,#F3E1E6 36px);background-size:100%% 36px}
+.diary-wrap{display:flex;gap:22px;flex:1}
+.diary-wrap .main{flex:1;display:flex;flex-direction:column;min-width:0}
+.her{width:250px;flex:none;display:flex;flex-direction:column;gap:10px;background:#FBF7FD;border-radius:18px;
+  padding:14px}
+.her .ht{display:flex;align-items:center;gap:8px;font-family:'Cute',sans-serif;font-size:19px;color:%(ink)s}
+.her .ht img{width:34px;height:34px;border-radius:50%%;object-fit:cover;border:2px solid #FFFFFF;
+  box-shadow:0 0 0 2px #D8CBF2}
+.her .minis{margin-top:0;padding-top:0}
+.her .fav{font-size:13px;color:%(sub)s;line-height:1.9}
 .diary .sign{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-top:auto;padding-top:12px;
   font-family:'Cute',sans-serif;font-size:18px;color:%(sub)s}
 .diary .sign img{width:36px;height:36px;border-radius:50%%;object-fit:cover;border:2px solid #FFFFFF;
@@ -209,6 +223,23 @@ body{width:%(width)dpx;background:#FFF9F1;color:%(ink)s;
 .rising .rw{background:#FFF4E6;border-radius:999px;padding:4px 12px;font-size:13px}
 .rising .rw b{font-family:'Cute',sans-serif;font-weight:400;font-size:17px;margin-right:5px}
 .rising .rw small{color:%(sub)s}
+.minis{display:grid;gap:10px;margin-top:auto;padding-top:16px}
+.mini{border-radius:14px;padding:9px 12px 8px;min-width:0}
+.mini b{display:block;font-family:'Cute',sans-serif;font-weight:400;font-size:23px;line-height:1.15;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mini b.txt{font-family:'Microsoft YaHei','Noto Sans CJK SC',sans-serif;font-weight:700;font-size:17px;
+  line-height:1.6}
+.mini span{display:block;font-size:12px;color:%(sub)s;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.card.sky .mini{background:rgba(255,255,255,.10) !important}
+.card.sky .mini b{color:#FFF3C4 !important}.card.sky .mini span{color:#C9C1EA}
+.parts{display:flex;flex-direction:column;gap:7px;width:100%%;margin-top:6px}
+.part{display:flex;align-items:center;gap:10px;font-size:13px}
+.part .pl{width:34px;color:%(sub)s}
+.part .pb{flex:1;height:12px;border-radius:0 6px 6px 0;background:#F7F0F3;position:relative}
+.part .pb i{position:absolute;left:0;top:0;bottom:0;border-radius:0 6px 6px 0}
+.part .pv{width:76px;text-align:right;color:%(sub)s;font-variant-numeric:tabular-nums}
+.also{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:12px;font-size:13px;color:%(sub)s}
+.also .chip{font-size:13px}
 .empty{color:%(sub)s;font-size:14px;padding:14px 4px;text-align:center}
 .footer{display:flex;justify-content:space-between;margin-top:16px;font-size:13px;color:#B9AEBF}
 """
@@ -245,6 +276,51 @@ def _avatar(view: dict[str, Any], uid: str) -> str:
 
 def _name(view: dict[str, Any], uid: str) -> str:
     return str((view.get("names") or {}).get(uid) or f"qq_{uid}")
+
+
+def _tag(view: dict[str, Any], uid: str) -> str:
+    return f'<span class="tag"><img src="{_avatar(view, uid)}"/>{esc(_name(view, uid))}</span>'
+
+
+def _name_variants(names: dict[str, str]) -> list[tuple[str, str]]:
+    """群友名字的几种写法 → uid：全名、去掉首尾标点的名字、中英混写名字里的中文部分。
+
+    她写日记时常把「临雀。」写成「临雀」、把「汝且候Attends un peu」写成「汝且候」。
+    同一个写法对上不止一个人就不用它；名字越长越先匹配，避免「小明」吃掉「小明同学」。
+    """
+    owners: dict[str, set[str]] = {}
+    for uid, name in names.items():
+        full = str(name or "").strip()
+        forms = {full, re.sub(r"^[\W_]+|[\W_]+$", "", full)}
+        if re.search(r"[A-Za-z]", full):
+            forms.update(run for run in re.findall(r"[一-鿿]{2,}", full))
+        for form in forms:
+            if len(form) >= 2:
+                owners.setdefault(form, set()).add(uid)
+    unique = [(form, next(iter(uids))) for form, uids in owners.items() if len(uids) == 1]
+    return sorted(unique, key=lambda item: -len(item[0]))
+
+
+def _rich(view: dict[str, Any], text: str) -> str:
+    """她写的字：``<@QQ号>`` 和直接写出来的群友名字都画成带头像的小名牌，其余转义。"""
+    by_name = _name_variants(view.get("names") or {})
+    out: list[str] = []
+    for index, part in enumerate(MENTION_RE.split(text or "")):
+        if index % 2:  # 标记里的 QQ 号
+            out.append(_tag(view, part))
+            continue
+        cursor = 0
+        while cursor < len(part):
+            hit = next(
+                ((name, uid) for name, uid in by_name if part.startswith(name, cursor)), None
+            )
+            if hit is None:
+                out.append(esc(part[cursor]))
+                cursor += 1
+                continue
+            out.append(_tag(view, hit[1]))
+            cursor += len(hit[0])
+    return "".join(out)
 
 
 def _title(text: str, icon_name: str, color: str, hint: str = "") -> str:
@@ -314,7 +390,7 @@ def _cover(
     else:
         picture = f'<div class="bigweather">{weather_icon(kind, 260)}</div>'
     line = (
-        f'<div class="quote-line"><div class="who">{esc(persona)} 说</div>{esc(headline)}</div>'
+        f'<div class="quote-line"><div class="who">{esc(persona)} 说</div>{_rich(view, headline)}</div>'
         if headline
         else ""
     )
@@ -347,7 +423,7 @@ def _chapters_html(view: dict[str, Any], report: dict[str, Any], *, weekly: bool
         cards.append(
             f'<div class="chapter"><div class="pin" style="background:{color}">{number}</div><div>'
             f'<div class="t">{esc(title)}</div><div class="when">{esc(when)}</div>'
-            + (f'<div class="s">{esc(summary)}</div>' if summary else "")
+            + (f'<div class="s">{_rich(view, summary)}</div>' if summary else "")
             + f'<div class="faces">{faces}<div class="chips">{chips}</div></div></div></div>'
         )
     if not cards:
@@ -432,19 +508,174 @@ def _rank_html(view: dict[str, Any], report: dict[str, Any], limit: int = 7) -> 
     return f'<div class="rank">{"".join(rows)}</div>'
 
 
-def _diary_card(view: dict[str, Any], *, title: str, sign_time: str, span: int = 1) -> str:
+def _her_panel(view: dict[str, Any], report: dict[str, Any], *, period: str) -> str:
+    """日记旁边的「她的今天」：她自己说了几句、接了几个人的话、最常接谁的话。"""
+    her = report.get("her") or {}
+    persona = view.get("persona_name") or "她"
+    face = view.get("persona_avatar") or art.initial_avatar(persona, "persona")
+    peak = her.get("peak_hour")
+    fav = her.get("favorite_uid")
+    fav_html = (
+        f'<div class="fav">最常接 {_tag(view, fav)} 的话 · {her.get("favorite_count", 0)} 次</div>'
+        if fav
+        else '<div class="fav">今天没怎么插话，安静地看着大家</div>'
+    )
+    return (
+        f'<div class="her"><div class="ht"><img src="{face}"/>{esc(persona)}的{esc(period)}</div>'
+        + _minis([(f"{her.get('count', 0)}句", "她说的话", VIOLET)])
+        + _minis(
+            [
+                (f"{her.get('answered_people', 0)}人", "接过谁的话", PINK),
+                (f"{peak}点" if peak is not None else "—", "她最活跃", BLUE),
+            ]
+        )
+        + fav_html
+        + "</div>"
+    )
+
+
+def _diary_card(
+    view: dict[str, Any],
+    report: dict[str, Any],
+    *,
+    title: str,
+    sign_time: str,
+    period: str,
+    span: int = 1,
+) -> str:
     diary = str((view.get("writing") or {}).get("diary") or "").strip()
     if not diary:
         return ""
     persona = view.get("persona_name") or "她"
     face = view.get("persona_avatar") or art.initial_avatar(persona, "persona")
-    return _card(
-        _title(title, "pencil", VIOLET),
-        f'<div class="lines">{esc(diary)}</div>'
-        f'<div class="sign"><img src="{face}"/>—— {esc(persona)} · {esc(sign_time)}</div>',
-        span=span,
-        extra="diary",
+    text = (
+        f'<div class="lines">{_rich(view, diary)}</div>'
+        f'<div class="sign"><img src="{face}"/>—— {esc(persona)} · {esc(sign_time)}</div>'
     )
+    if span >= 2:
+        panel = _her_panel(view, report, period=period)
+        body = f'<div class="diary-wrap"><div class="main">{text}</div>{panel}</div>'
+    else:
+        # 一格宽时把「她的这周」压成底部一条小统计，免得把整行撑高
+        her = report.get("her") or {}
+        fav = her.get("favorite_uid")
+        body = text + _minis(
+            [
+                (f"{her.get('count', 0)}句", "她说的话", VIOLET),
+                (f"{her.get('answered_people', 0)}人", "接过谁的话", PINK),
+                (_name(view, fav) if fav else "—", "最常接谁的话", BLUE),
+            ]
+        )
+    return _card(_title(title, "pencil", VIOLET), body, span=span, extra="diary")
+
+
+def _minis(items: Sequence[tuple[str, str, str]]) -> str:
+    """卡片底部那一行小统计：(数值, 说明, 颜色)。同一行卡片的这一条都压在底边上，对得齐。"""
+    items = [item for item in items if item[0]]
+    if not items:
+        return ""
+    cells = "".join(
+        f'<div class="mini" style="background:{TINTS[color]}">'
+        f'<b class="{"" if value[:1].isdigit() else "txt"}" style="color:{color}">{esc(value)}</b>'
+        f"<span>{esc(label)}</span></div>"
+        for value, label, color in items
+    )
+    return (
+        f'<div class="minis" style="grid-template-columns:repeat({len(items)},1fr)">{cells}</div>'
+    )
+
+
+def _duration(minutes: int) -> str:
+    if minutes < 60:
+        return f"{minutes}分钟"
+    return f"{minutes // 60}时{minutes % 60:02d}分"
+
+
+def _pct(value: float) -> str:
+    return f"{round(value * 100)}%"
+
+
+def _dayparts_html(report: dict[str, Any]) -> str:
+    parts = report.get("dayparts") or []
+    top = max((part["count"] for part in parts), default=0) or 1
+    colors = (VIOLET, ORANGE, PINK, BLUE)
+    rows = "".join(
+        f'<div class="part"><span class="pl">{esc(part["label"])}</span>'
+        f'<span class="pb"><i style="width:{max(2, round(part["count"] / top * 100))}%;'
+        f'background:{colors[index % 4]}"></i></span>'
+        f'<span class="pv">{part["count"]} · {_pct(part["share"])}</span></div>'
+        for index, part in enumerate(parts)
+    )
+    return f'<div class="parts">{rows}</div>'
+
+
+def _rhythm_minis(report: dict[str, Any]) -> str:
+    rhythm = report.get("rhythm") or {}
+    silence = rhythm.get("silence") or {}
+    reply = (report.get("social") or {}).get("reply_median")
+    return _minis(
+        [
+            (f"{rhythm.get('sessions', 0)}段", "成段的聊天", ORANGE),
+            (_duration(rhythm.get("longest_minutes", 0)), "最长的一段", PINK),
+            (
+                _duration(silence.get("minutes", 0)) if silence.get("minutes") else "",
+                f"最长的安静 · {fmt_clock(silence.get('start', 0))} 起",
+                VIOLET,
+            ),
+            (f"{reply}秒" if reply is not None else "", "接话的中位数", BLUE),
+        ]
+    )
+
+
+def _laugh_minis(view: dict[str, Any], report: dict[str, Any]) -> str:
+    laughs = report.get("laugh_stats") or {}
+    peak = laughs.get("peak_hour")
+    return _minis(
+        [
+            (f"{laughs.get('total', 0)}次", f"笑声 · 占 {_pct(laughs.get('share', 0))}", ORANGE),
+            (
+                _name(view, laughs["top_uid"]) if laughs.get("top_uid") else "",
+                f"最爱笑 · {laughs.get('top_count', 0)} 次",
+                PINK,
+            ),
+            (f"{peak}点" if peak is not None else "", "笑声最多", VIOLET),
+        ]
+    )
+
+
+def _social_minis(view: dict[str, Any], report: dict[str, Any]) -> str:
+    social = report.get("social") or {}
+    hub = social.get("hub_uid")
+    return _minis(
+        [
+            (f"{social.get('links', 0)}", "次你来我往", PINK),
+            (
+                _name(view, hub) if hub else "",
+                f"社交中心 · 和 {social.get('hub_partners', 0)} 人聊过",
+                BLUE,
+            ),
+            (f"{social.get('mentions', 0)}次", "互相 @", GREEN),
+        ]
+    )
+
+
+def _crowd_minis(report: dict[str, Any]) -> str:
+    crowd = report.get("crowd") or {}
+    return _minis(
+        [
+            (_pct(crowd.get("top3_share", 0)), "前三名说的", PINK),
+            (f"{round(crowd.get('average', 0))}条", "人均", BLUE),
+            (f"{crowd.get('passers', 0)}人", "路过打招呼", GREEN),
+        ]
+    )
+
+
+def _also_words(report: dict[str, Any]) -> str:
+    words = report.get("more_words") or []
+    if not words:
+        return ""
+    chips = "".join(f'<span class="chip">{esc(word)}</span>' for word in words[:7])
+    return f'<div class="also">也聊到了 {chips}</div>'
 
 
 def _people_row(view: dict[str, Any], uids: Sequence[str]) -> str:
@@ -486,7 +717,7 @@ def _river(view: dict[str, Any], report: dict[str, Any], *, weekly: bool) -> str
         end=report["end"],
         chapters=report["sessions"],
         width=_inner(2),
-        height=120,
+        height=100,
         tick_labels=_river_ticks(report["start"], report["end"], weekly=weekly),
     )
 
@@ -562,34 +793,84 @@ def render_day_html(report: dict[str, Any], view: dict[str, Any]) -> str:
     peak_hour = hours.index(max(hours)) if any(hours) else None
     clock = art.flower_clock(
         hours,
-        size=320,
+        size=260,
         center_label=f"{peak_hour}点" if peak_hour is not None else "安静",
         center_sub="最热闹" if peak_hour is not None else "",
     )
-    bubbles = art.bubbles(report["keywords"][:9], width=_inner(), height=330)
-    diary = _diary_card(view, title="她的日记", sign_time=end.strftime("%m月%d日 %H:%M"), span=2)
+    first, last = report.get("first"), report.get("last")
+    clock_body = (
+        f'<div style="display:flex;justify-content:center">{clock}</div>'
+        + _dayparts_html(report)
+        + _minis(
+            [
+                (
+                    fmt_clock(first["ts"]) if first else "",
+                    f"第一句 · {short(first['name'], 6)}" if first else "",
+                    ORANGE,
+                ),
+                (
+                    fmt_clock(last["ts"]) if last else "",
+                    f"最后一句 · {short(last['name'], 6)}" if last else "",
+                    VIOLET,
+                ),
+            ]
+        )
+    )
+    bubbles = art.bubbles(report["keywords"][:12], width=_inner(), height=330)
+    diary = _diary_card(
+        view,
+        report,
+        title="她的日记",
+        sign_time=end.strftime("%m月%d日 %H:%M"),
+        period="今天",
+        span=2,
+    )
+    crowd = report.get("crowd") or {}
     cells = [
         cover,
         _card(
             _title("今日剧情", "spark", ORANGE, "河越宽，聊得越凶"),
-            _river(view, report, weekly=False) + _chapters_html(view, report, weekly=False),
+            _river(view, report, weekly=False)
+            + _chapters_html(view, report, weekly=False)
+            + _rhythm_minis(report),
             span=2,
         ),
-        _card(_title("花朵时钟", "sun", PINK, "花瓣越长越热闹"), clock, mid=True),
-        _card(_title("今日称号", "crown", GOLD, "每人最多一个"), _awards_html(view, report)),
-        _card(_title("笑点与复读", "laugh", ORANGE), _quotes_html(view, report, weekly=False)),
+        _card(_title("花朵时钟", "sun", PINK, "花瓣越长越热闹"), clock_body),
+        _card(
+            _title("今日称号", "crown", GOLD, "每人最多一个"),
+            _awards_html(view, report)
+            + _minis(
+                [
+                    (f"{len(report['awards'])}人", "拿到称号", GOLD),
+                    (f"{round(crowd.get('chars_per_msg', 0))}字", "平均一句", BLUE),
+                    (f"{report['stickers']}张", "表情包", GREEN),
+                ]
+            ),
+        ),
+        _card(
+            _title("笑点与复读", "laugh", ORANGE),
+            _quotes_html(view, report, weekly=False, limit=5) + _laugh_minis(view, report),
+        ),
         _card(
             _title("话题泡泡", "chat", BLUE, "反复出现的词"),
-            bubbles or '<div class="empty">没什么高频词</div>',
-            mid=True,
+            (
+                f'<div style="display:flex;justify-content:center">{bubbles}</div>'
+                if bubbles
+                else '<div class="empty">没什么高频词</div>'
+            )
+            + _also_words(report),
         ),
         # 最后一行贯穿封面下方：排行 | CP | 日记（两格）
         _card(
             _title("冒泡排行", "people", BLUE, f"共 {report['people_count']} 人"),
-            _rank_html(view, report),
+            _rank_html(view, report, 9) + _crowd_minis(report),
             span=1 if diary else 2,
         ),
-        _card(_title("聊得来的两个人", "heart", PINK), _pairs_html(view, report), span=1 if diary else 2),
+        _card(
+            _title("聊得来的两个人", "heart", PINK),
+            _pairs_html(view, report) + _social_minis(view, report),
+            span=1 if diary else 2,
+        ),
         diary,
     ]
     return _page(cells, view, "群聊手帐 · 日报")
@@ -698,17 +979,44 @@ def render_week_html(report: dict[str, Any], view: dict[str, Any]) -> str:
             + "</div>"
         )
     bubbles = art.bubbles(
-        report["keywords"][:8], width=_inner(), height=250 if rising_html else 320
+        report["keywords"][:10], width=_inner(), height=270 if rising_html else 320
     )
     topics = (
-        f'<div style="display:flex;justify-content:center">{bubbles}</div>' if bubbles else ""
-    ) + rising_html
+        (f'<div style="display:flex;justify-content:center">{bubbles}</div>' if bubbles else "")
+        + rising_html
+        + _also_words(report)
+    )
+    rhythm = report.get("week_rhythm") or {}
+    hot = rhythm.get("hot_slot") or {}
+    calendar_minis = _minis(
+        [
+            (
+                f"{WEEKDAYS[hot['weekday']]}{hot['hour']}点" if hot.get("count") else "",
+                f"最热的钟点 · {hot.get('count', 0)} 条",
+                PINK,
+            ),
+            (f"{round(rhythm.get('weekday_avg', 0))}条", "工作日日均", BLUE),
+            (f"{round(rhythm.get('weekend_avg', 0))}条", "周末日均", ORANGE),
+        ]
+    )
+    social = report.get("social") or {}
+    sky_minis = _minis(
+        [
+            (
+                _name(view, social["hub_uid"]) if social.get("hub_uid") else "",
+                f"社交中心 · 和 {social.get('hub_partners', 0)} 人聊过",
+                GOLD,
+            ),
+            (f"{social.get('links', 0)}", "次你来我往", PINK),
+        ]
+    )
 
-    diary = _diary_card(view, title="她的周记", sign_time=end.strftime("%m月%d日"))
+    diary = _diary_card(view, report, title="她的周记", sign_time=end.strftime("%m月%d日"), period="这周")
     rank_card = _card(
         _title("冒泡排行", "people", BLUE, f"共 {report['people_count']} 人"),
-        _rank_html(view, report),
+        _rank_html(view, report, 10) + _crowd_minis(report),
     )
+    crowd_stats = report.get("crowd") or {}
     cells = [
         cover,
         _card(
@@ -719,23 +1027,43 @@ def render_week_html(report: dict[str, Any], view: dict[str, Any]) -> str:
         ),
         _card(
             _title("本周大事记", "spark", ORANGE, "每天最热的那一段"),
-            _river(view, report, weekly=True) + _chapters_html(view, report, weekly=True),
+            _river(view, report, weekly=True)
+            + _chapters_html(view, report, weekly=True)
+            + _rhythm_minis(report),
             span=2,
         ),
-        _card(_title("群友星座", "star", GOLD, "连线越亮聊得越多"), sky_body, mid=True, extra="sky"),
+        _card(
+            _title("群友星座", "star", GOLD, "连线越亮聊得越多"),
+            f'<div style="display:flex;justify-content:center">{sky_body}</div>' + sky_minis,
+            extra="sky",
+        ),
         _card(
             _title("糖豆日历", "star", PINK, "豆子越大越热闹"),
-            art.candy_calendar(report["grid"], width=_inner()),
-            mid=True,
+            art.candy_calendar(report["grid"], width=_inner())
+            + _dayparts_html(report)
+            + calendar_minis,
         ),
-        _card(_title("本周之星", "crown", GOLD), _awards_html(view, report)),
+        _card(
+            _title("本周之星", "crown", GOLD),
+            _awards_html(view, report)
+            + _minis(
+                [
+                    (f"{len(report['awards'])}人", "拿到称号", GOLD),
+                    (f"{round(crowd_stats.get('chars_per_msg', 0))}字", "平均一句", BLUE),
+                    (f"{report['stickers']}张", "表情包", GREEN),
+                ]
+            ),
+        ),
         _card(_title("本周话题", "chat", BLUE), topics or '<div class="empty">没有高频词</div>'),
         # 最后一行贯穿封面下方：排行 | CP | 笑点 | 周记
         rank_card,
-        _card(_title("聊得来的两个人", "heart", PINK), _pairs_html(view, report)),
+        _card(
+            _title("聊得来的两个人", "heart", PINK),
+            _pairs_html(view, report) + _social_minis(view, report),
+        ),
         _card(
             _title("笑点与复读", "laugh", ORANGE),
-            _quotes_html(view, report, weekly=True),
+            _quotes_html(view, report, weekly=True, limit=5) + _laugh_minis(view, report),
             span=1 if diary else 2,
         ),
         diary,
