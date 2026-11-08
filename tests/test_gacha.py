@@ -27,6 +27,7 @@ from PIL import Image, ImageDraw
 
 from sirius_pulse.memory.basic import BasicMemoryFileStore
 from sirius_pulse.memory.basic.models import BasicMemoryEntry
+from sirius_pulse.people import PersonService
 from sirius_pulse.platforms.onebot_v11.napcat.adapter import NapCatAdapter
 from sirius_pulse.plugins.context import MessageContext
 from sirius_pulse.plugins.dispatcher import OutputDispatcher
@@ -34,6 +35,7 @@ from sirius_pulse.plugins.executor import PluginExecutor
 from sirius_pulse.plugins.lexer import CommandParser, Lexer, PluginMatcher
 from sirius_pulse.plugins.loader import PluginLoader
 from sirius_pulse.plugins.registry import PluginRegistry
+from sirius_pulse.visual import VisualService, policies
 
 GROUP = "730101"
 OTHER_GROUP = "730202"
@@ -97,6 +99,49 @@ class Engine:
             persona_assets_dir=assets,
         )
         self.assistant_emotion = SimpleNamespace(valence=0.2)
+        # 人物与视觉资产服务用框架的真实实现：「画我」的授权、额度、隔离都由它们判定。
+        self.person_service = PersonService(None, persona_name="月白")
+        self.visual_service = VisualService(
+            work_path / "visual", people=self.person_service, conn=self.person_service.conn
+        )
+        self._evidence_seq = 0
+
+    def record(self, group_id: str, user_id: str, text: str, attachments=()) -> str:
+        """宿主感知层为群友的每条消息记下来源证据（插件指令也一样）。"""
+        _name, uid, _ = PEOPLE[user_id]
+        self._evidence_seq += 1
+        return self.person_service.record_evidence(
+            group_id=group_id,
+            user_id=user_id,
+            platform="qq",
+            platform_uid=uid,
+            message_id=f"msg-{self._evidence_seq}",
+            content=text,
+            attachments=[str(path) for path in attachments],
+        )
+
+    async def register_look(self, user_id: str) -> None:
+        """群友本人发一张照片说“记一下我的样子”，在视觉资产系统里登记成正式形象。"""
+        from sirius_pulse.people import PersonAccess
+
+        photo = self.work_path / f"look-{user_id}.png"
+        photo.write_bytes(_png((210, 40, 40)))
+        ref = self.record(GROUP, user_id, "记一下我的样子", [photo])
+        person_id = self.person_service.person_id_for_user(user_id)
+        access = PersonAccess(actor_id=person_id, group_id=GROUP, evidence_refs=(ref,))
+        self.person_service.update_names(person_id, access, ref, preferred_name=PEOPLE[user_id][0])
+        staged = await self.visual_service.manage(
+            "stage",
+            access=access,
+            evidence_ref=ref,
+            target={"ref": "requester"},
+            source={"kind": "attachment", "index": 0},
+            identity_description="短发，戴眼镜",
+            default_outfit="格子衬衫",
+            view="正面",
+            activate=True,
+        )
+        assert staged["success"], staged
 
     def _profiles(self, group_id):
         if group_id != GROUP:
@@ -224,6 +269,7 @@ class Chat:
                 message_id="1",
                 content=text,
                 speaker_name=name,
+                evidence_ref=self.engine.record(group_id, user, text),
             ),
         )
         replies = []
@@ -833,6 +879,189 @@ async def test_her_daily_painting_budget_makes_the_rest_wait_until_tomorrow(chat
 
     chat.clock[0] = _cn(2, 9)
     assert await plugin.art_beat() is True
+
+
+# --- 画我：本人同意后照他本人的样子画觉醒插画 ------------------------------------------
+
+
+async def _awaken_ming(chat, plugin, owner: str = "u-hong") -> None:
+    """小红（或别人）把阿明那张 No.001 升到三星并觉醒，她把插画画完。"""
+    await _three_stars(chat, plugin, user=owner, no=1)
+    await chat.send("/觉醒 1", user=owner)
+    chat.engine.replies.append(awaken_reply())
+    assert await plugin.art_beat() is True
+
+
+def _person_jobs(chat, user: str) -> list[dict]:
+    engine = chat.engine
+    person_id = engine.person_service.person_id_for_user(user)
+    return engine.visual_service.store.jobs_for(person_id, limit=10)
+
+
+def _consent(chat, user: str) -> dict:
+    proxy = chat.registry.get_instance("gacha").ctx.engine
+    return proxy.get_person_image_consent(user_id=user, group_id=GROUP)
+
+
+@pytest.mark.asyncio
+async def test_a_member_who_says_draw_me_is_painted_from_their_own_registered_look(chat):
+    plugin = await _three_cards(chat)
+    await chat.engine.register_look("u-ming")
+
+    await chat.send("/我的卡 画我", user="u-ming")
+    assert "本人的样子" in chat.said() and "还没在我这里登记" not in chat.said()
+    await chat.send("/我的卡", user="u-ming")
+    assert "不画我 可以撤回" in chat.said()
+
+    await _awaken_ming(chat, plugin)
+
+    [awaken_prompt] = [p for p in chat.engine.prompts if "【觉醒】" in p]
+    assert "本人同意了被画进来" in awaken_prompt and "象征物" not in awaken_prompt
+    [painting] = chat.engine.paintings
+    # 走框架的受管人物生图：他登记的形象 + 她自己的形象图，提示词由视觉资产系统编译。
+    assert len(painting.reference_images) == 2
+    assert "严格按他本人的人物参考图" in painting.prompt and "阿明" in painting.prompt
+    [job] = _person_jobs(chat, "u-ming")
+    assert job["queue_state"] == "done" and job["grant_id"] == _consent(chat, "u-ming")["grant_id"]
+    [news] = chat.engine.announced
+    assert "没能照" not in news["text"]
+    awakened = next(c for c in plugin._gacha().cards(GROUP) if c.kind == "awakened")
+    assert awakened.art and awakened.art_likeness
+
+
+@pytest.mark.parametrize(
+    ("registered", "says_draw_me", "told"),
+    [
+        (True, False, ""),  # 登记了形象，但本人没同意：照旧象征物，不提他
+        (False, True, "还没有登记形象图"),  # 同意了但没登记：象征物，并如实说一句
+    ],
+)
+@pytest.mark.asyncio
+async def test_without_consent_or_a_registered_look_he_stays_a_symbol(
+    chat, registered, says_draw_me, told
+):
+    plugin = await _three_cards(chat)
+    if registered:
+        await chat.engine.register_look("u-ming")
+    if says_draw_me:
+        await chat.send("/我的卡 画我", user="u-ming")
+        assert "还没在我这里登记过形象图" in chat.said()
+
+    await _awaken_ming(chat, plugin)
+
+    [painting] = chat.engine.paintings
+    assert [name for name, _ in painting.reference_images] == ["turnaround.png"]
+    assert "象征物" in painting.prompt and "真实人物" in painting.prompt
+    assert _person_jobs(chat, "u-ming") == [], "没有提交任何人物生图任务"
+    [news] = chat.engine.announced
+    assert (told in news["text"]) if told else "没能照" not in news["text"]
+
+
+@pytest.mark.asyncio
+async def test_draw_me_must_be_said_by_the_member_themself(chat):
+    await _three_cards(chat)
+    await chat.engine.register_look("u-ming")
+    plugin = await chat.plugin()
+    plugin.ctx.message.evidence_ref = ""  # 宿主没能为这条消息记下来源（比如人物模块故障）
+
+    response = await plugin._consent_likeness(GROUP, "u-ming")
+
+    assert "没法确认这句话是你本人发的" in response.text
+    assert _consent(chat, "u-ming")["consented"] is False
+
+
+@pytest.mark.asyncio
+async def test_after_draw_me_is_withdrawn_his_portrait_comes_down_and_is_not_drawn_again(chat):
+    plugin = await _three_cards(chat)
+    await chat.engine.register_look("u-ming")
+    await chat.send("/我的卡 画我", user="u-ming")
+    await _awaken_ming(chat, plugin)
+    store = plugin._gacha()
+    awakened = next(c for c in store.cards(GROUP) if c.kind == "awakened")
+    art_file = plugin.get_artifact_dir() / "art" / awakened.art
+    assert art_file.is_file()
+
+    await chat.send("/我的卡 不画我", user="u-ming")
+
+    assert "撤下了" in chat.said()
+    assert not art_file.exists()
+    assert store.card(GROUP, awakened.card_id).art == "", "卡还在，插画撤下"
+    await chat.send(f"/卡 {awakened.no}", user="u-hong")
+    [card_image] = chat.images()
+    assert card_image.height == 900, "撤下插画后回到普通卡面"
+    # 框架那边：授权撤回，依据它画出的结果隔离。
+    assert _consent(chat, "u-ming")["consented"] is False
+    [job] = _person_jobs(chat, "u-ming")
+    asset = chat.engine.visual_service.store.asset(job["result_asset_id"])
+    assert asset["status"] == "isolated"
+
+    # 老王也把阿明的卡觉醒：这次只用象征物画他。
+    await _awaken_ming(chat, plugin, owner="u-wang")
+    painting = chat.engine.paintings[-1]
+    assert [name for name, _ in painting.reference_images] == ["turnaround.png"]
+    assert len(_person_jobs(chat, "u-ming")) == 1
+
+
+@pytest.mark.asyncio
+async def test_withdrawing_while_she_is_painting_keeps_him_out_of_the_picture(chat):
+    plugin = await _three_cards(chat)
+    await chat.engine.register_look("u-ming")
+    await chat.send("/我的卡 画我", user="u-ming")
+    await _three_stars(chat, plugin)
+    await chat.send("/觉醒 1", user="u-hong")
+    chat.engine.replies.append(awaken_reply())
+    paint = chat.engine._paint
+
+    async def paint_while_he_withdraws(request):
+        if len(chat.engine.paintings) == 0:
+            await chat.send("/我的卡 不画我", user="u-ming")
+        return await paint(request)
+
+    chat.engine.brain.generate_image_async = paint_while_he_withdraws
+    assert await plugin.art_beat() is True
+
+    first, second = chat.engine.paintings
+    assert len(first.reference_images) == 2, "开始画时他还同意着"
+    assert [name for name, _ in second.reference_images] == ["turnaround.png"], "撤回后改画象征物"
+    [job] = _person_jobs(chat, "u-ming")
+    assert job["queue_state"] == "isolated", "画到一半撤回：那张结果隔离，不交付"
+    awakened = next(c for c in plugin._gacha().cards(GROUP) if c.kind == "awakened")
+    assert awakened.art and not awakened.art_likeness
+
+
+@pytest.mark.asyncio
+async def test_when_the_person_image_quota_is_used_up_she_says_so_and_uses_a_symbol(chat):
+    plugin = await _three_cards(chat)
+    await chat.engine.register_look("u-ming")
+    await chat.send("/我的卡 画我", user="u-ming")
+    store = chat.engine.visual_service.store
+    store.set_setting(policies.SETTING_TOTAL_QUOTA, 0, actor_id="admin")
+
+    await _awaken_ming(chat, plugin)
+
+    [painting] = chat.engine.paintings
+    assert [name for name, _ in painting.reference_images] == ["turnaround.png"]
+    [news] = chat.engine.announced
+    assert "没能照 阿明 本人的样子画：人物生图的额度用完了" in news["text"]
+    assert _person_jobs(chat, "u-ming") == []
+    assert _consent(chat, "u-ming")["consented"] is True, "额度不够不等于撤回同意"
+
+
+@pytest.mark.asyncio
+async def test_opting_out_also_withdraws_draw_me(chat):
+    plugin = await _three_cards(chat)
+    await chat.engine.register_look("u-ming")
+    await chat.send("/我的卡 画我", user="u-ming")
+    await _awaken_ming(chat, plugin)
+    art_dir = plugin.get_artifact_dir()
+    assert list((art_dir / "art").iterdir())
+
+    await chat.send("/我的卡 退出", user="u-ming")
+    await chat.send("/我的卡 加入", user="u-ming")
+
+    assert _consent(chat, "u-ming")["consented"] is False
+    assert plugin._gacha().likeness_consent(GROUP, "u-ming") == ""
+    assert not list((art_dir / "art").iterdir()), "画了他的卡和插画文件一起删掉"
 
 
 # --- 规则 -----------------------------------------------------------------------

@@ -227,6 +227,13 @@ _ART_BOUNDS = (
     "画面里不要有文字、号码或链接。\n"
 )
 
+# 本人同意了「画我」：他本人可以出现，但长相交给他登记的形象图，不能由她来描写。
+_LIKENESS_BOUNDS = (
+    "画面要求：卡上的这位群友本人同意了被画进来，会严格照他自己登记的形象来画；"
+    "他本人和你可以同框出现，但不要描写他的长相、身材和穿着，只写他在做什么、你们怎么相处、"
+    "表情和氛围；除了你们俩，不要再画别的真实的人。画面里不要有文字、号码或链接。\n"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class AwakenText:
@@ -237,7 +244,10 @@ class AwakenText:
     scene: str
 
 
-def build_awaken_prompt(*, owner: str, card_name: str, title: str, skill: str, note: str) -> str:
+def build_awaken_prompt(
+    *, owner: str, card_name: str, title: str, skill: str, note: str, likeness: bool = False
+) -> str:
+    """觉醒卡的卡面与画面。``likeness`` 表示卡上的人同意了「画我」且登记了形象图。"""
     return (
         "【觉醒】\n"
         f"群友「{owner}」把你画的卡 {card_name}「{title}」收集到了三星，现在要让它觉醒成一张 SSR 超级卡。"
@@ -247,7 +257,7 @@ def build_awaken_prompt(*, owner: str, card_name: str, title: str, skill: str, n
         f"- skill_text：觉醒技能效果，{MAX_SKILL_TEXT} 字以内，写成卡牌游戏那样的效果描述；\n"
         f"- note：写给「{owner}」的一句话，{MAX_NOTE} 字以内；你原来的批注是「{note}」；\n"
         f"- scene：这张插画画什么，{MAX_SCENE} 字以内，写清楚场景、构图、光线和氛围。\n"
-        + _ART_BOUNDS
+        + (_LIKENESS_BOUNDS if likeness else _ART_BOUNDS)
         + _BOUNDS
         + "只输出一个 JSON 对象，不要任何别的文字：\n"
         '{"title": "", "skill_name": "", "skill_text": "", "note": "", "scene": ""}\n\n' + _SAFETY
@@ -283,7 +293,19 @@ def parse_scene(text: str) -> str:
     return _clip(text, MAX_SCENE).strip("“”\"'「」 ")
 
 
-def image_prompt(scene: str, *, persona_name: str, has_reference: bool) -> str:
-    """交给生图模型的最终描述：她写的画面 + 固定的画风与边界。"""
+def image_prompt(
+    scene: str, *, persona_name: str, has_reference: bool, likeness_name: str = ""
+) -> str:
+    """交给生图模型的最终描述：她写的画面 + 固定的画风与边界。
+
+    ``likeness_name`` 非空表示这张走受管的人物生图，画里照这个人登记的形象画他本人；
+    他的参考图与图序由视觉资产系统编进最终提示词，这里只管画风和边界。
+    """
     her = f"如果画面里出现「{persona_name}」，她的长相和服装严格按参考图。" if has_reference else ""
-    return f"{scene}\n" "画风：精致的日系插画，夜色与月光的冷色调，柔和的光晕，适合做收藏卡的竖幅主图。" f"{her}画面中不要出现任何文字、真实人物的脸、号码或链接。"
+    style = "画风：精致的日系插画，夜色与月光的冷色调，柔和的光晕，适合做收藏卡的竖幅主图。"
+    if likeness_name:
+        return (
+            f"{scene}\n{style}{her}画面中的「{likeness_name}」严格按他本人的人物参考图画；"
+            "除此之外不要出现别的真实人物，也不要出现任何文字、号码或链接。"
+        )
+    return f"{scene}\n{style}{her}卡上的那位群友只用象征物表示，" "画面中不要出现任何文字、真实人物的脸、号码或链接。"

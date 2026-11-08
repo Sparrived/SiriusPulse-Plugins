@@ -12,6 +12,11 @@
 
 卡都在后台慢慢画（每次心跳、每天都有上限），只在有人玩过的群里画；插画由另一个
 后台任务一张张画，画好了她在群里叫人。
+
+**画我**：插画里默认没有真实的人。卡上的人自己发 ``/我的卡 画我`` 同意、并且在框架的
+视觉资产系统里登记了形象图，他的觉醒卡插画才照他本人的样子画——同意记成视觉资产
+授权，画的时候走框架的受管人物生图入口（授权、额度、预检、隔离都在框架里）。
+``/我的卡 不画我`` 或 ``退出`` 撤回：以后不再这样画，已经照他画好的插画立刻从卡上撤下。
 """
 
 from __future__ import annotations
@@ -26,7 +31,13 @@ from typing import Any
 
 from sirius_pulse.adapters.models import ImageSegment, MessageGroup, TextSegment
 from sirius_pulse.extension_runtime import BackgroundTaskSpec
-from sirius_pulse.plugins.api import CommandAST, PluginBase, PluginResponse, command
+from sirius_pulse.plugins.api import (
+    CommandAST,
+    PersonImageError,
+    PluginBase,
+    PluginResponse,
+    command,
+)
 
 from .members import (
     Member,
@@ -74,8 +85,16 @@ _HELP = (
     "/交换 <人> <我的编号> <他的编号>：提出交换，对方发 /同意交换 或 /拒绝交换\n"
     "/升星 <编号>：用一张重复的卡升星，我会在你那张上多写一句\n"
     "/觉醒 <编号>：三星卡觉醒成 SSR 超级卡，我专门为你画一张插画\n"
-    "/我的卡：看看我给你画的卡；/我的卡 退出 不想被画进图鉴，/我的卡 加入 回来"
+    "/我的卡：看看我给你画的卡；/我的卡 退出 不想被画进图鉴，/我的卡 加入 回来\n"
+    "/我的卡 画我：同意我画觉醒插画时照你本人登记的形象画你；/我的卡 不画我 撤回"
 )
+
+# 受管人物生图没做成时，觉醒卡照旧用象征物画；这几种原因要在群里如实说一句。
+_LIKENESS_FALLBACK_NOTES = {
+    "quota_exceeded": "人物生图的额度用完了",
+    "required_asset_missing": "还没有登记形象图",
+    "asset_invalid": "登记的形象图停用了",
+}
 
 _AVATAR_URL = "https://q1.qlogo.cn/g?b=qq&nk={uid}&s=640"
 _AVATAR_TTL_SECONDS = 7 * 24 * 3600
@@ -103,7 +122,7 @@ class GachaPlugin(PluginBase):
     _plugin_name = "gacha"
     _plugin_display_name = "群友图鉴"
     _plugin_description = "她给群友画收藏卡：/抽卡 每天一抽，/图鉴 看收集进度，/送卡 /交换 /升星 /觉醒，" "/我的卡 退出 随时不再入画。"
-    _plugin_version = "0.3.0"
+    _plugin_version = "0.4.0"
     _plugin_author = "Sirius Pulse"
     _plugin_min_framework_version = "1.3.0"
     _plugin_dependencies = ["httpx>=0.24.0", "Pillow>=9.0.0"]
@@ -155,7 +174,8 @@ class GachaPlugin(PluginBase):
         "title": "群友图鉴",
         "description": (
             "她只用群友在本群的公开发言写卡；私聊和别的群的内容不会出现在卡上。"
-            "插画里不会出现真实的人，群友只用象征物表示。"
+            "插画里默认不出现真实的人，群友只用象征物表示；只有本人发 /我的卡 画我 同意、"
+            "并登记了形象图，她才照他本人的样子画觉醒插画（经视觉资产系统授权，随时可撤回）。"
             "群友发 /我的卡 退出 即可删掉自己的卡和自己出演的名场面。"
         ),
         "parameters": {
@@ -218,9 +238,9 @@ class GachaPlugin(PluginBase):
         prefix="/",
         patterns=["我的卡"],
         render_mode="direct",
-        description="看她给你画的卡，或退出/加入图鉴。",
+        description="看她给你画的卡，退出/加入图鉴，或同意/撤回照你本人的样子画插画。",
         hidden_from_intent=True,
-        examples=["/我的卡", "/我的卡 退出", "/我的卡 加入"],
+        examples=["/我的卡", "/我的卡 退出", "/我的卡 加入", "/我的卡 画我", "/我的卡 不画我"],
     )
     async def my_card(self) -> PluginResponse:
         return PluginResponse.ok(text=_HELP)
@@ -438,23 +458,103 @@ class GachaPlugin(PluginBase):
         owner = self._owner_id()
         now = _now().isoformat()
         if action in {"退出", "不要", "删除"}:
+            # 先把插件这边的同意和照他画的插画处理掉，再去框架撤授权（那一步有 await）。
+            doomed = [card for card in store.cards(group_id) if card.involves(owner)]
             store.opt_out(group_id, owner, now)
+            self._forget_art(doomed)
+            await self._revoke_likeness(group_id, owner)
             return PluginResponse.ok(text=self._line("opted_out"))
         if action in {"加入", "回来"}:
             if store.opt_in(group_id, owner):
                 return PluginResponse.ok(text=self._line("opted_in"))
             return PluginResponse.ok(text="你本来就在图鉴里呀。")
+        if action in {"画我", "照我画"}:
+            return await self._consent_likeness(group_id, owner)
+        if action in {"不画我", "别画我"}:
+            return await self._withdraw_likeness(group_id, owner)
         if action:
-            return PluginResponse.ok(text="用法：/我的卡、/我的卡 退出、/我的卡 加入")
+            return PluginResponse.ok(text="用法：/我的卡、/我的卡 退出、/我的卡 加入、/我的卡 画我、/我的卡 不画我")
         if owner in store.opted_out(group_id):
             return PluginResponse.ok(text="你退出了图鉴，所以我没有画你。想回来的话发 /我的卡 加入。")
         card = store.card_of(group_id, owner)
         if card is None:
             return PluginResponse.ok(text=self._line("no_card_yet"))
+        caption = f"我给你画的卡：「{card.title}」"
+        if store.likeness_consent(group_id, owner):
+            caption += "（你同意了觉醒插画照你本人的样子画，/我的卡 不画我 可以撤回）"
         return self._image(
-            f"我给你画的卡：「{card.title}」",
-            await self._render(card, store.owned(group_id, owner, card.card_id)),
+            caption, await self._render(card, store.owned(group_id, owner, card.card_id))
         )
+
+    # ── 画我：同意与撤回 ──────────────────────────────────────────────
+
+    async def _consent_likeness(self, group_id: str, owner: str) -> PluginResponse:
+        """本人同意：用他这条消息的来源证据在视觉资产系统里记一条授权。"""
+        store = self._gacha()
+        if owner in store.opted_out(group_id):
+            return PluginResponse.ok(text="你退出了图鉴，我不会画你。想回来先发 /我的卡 加入。")
+        try:
+            consent = self.ctx.engine.grant_person_image_consent(
+                user_id=owner, group_id=group_id, evidence_ref=self.ctx.message.evidence_ref
+            )
+        except PersonImageError as exc:
+            self.logger.info("「画我」没有记下：%s", exc.code)
+            if exc.code == "unavailable":
+                return PluginResponse.ok(text="这里还没接上形象登记，我暂时没法照你本人的样子画。")
+            return PluginResponse.ok(text="我没法确认这句话是你本人发的，过一会儿再说一次吧。")
+        store.set_likeness_consent(group_id, owner, consent["grant_id"], _now().isoformat())
+        text = self._line("likeness_on")
+        if not consent.get("has_reference"):
+            text += "（你还没在我这里登记过形象图，登记之前插画里还是用象征物代表你。）"
+        return PluginResponse.ok(text=text + "不想了随时发 /我的卡 不画我。")
+
+    async def _withdraw_likeness(self, group_id: str, owner: str) -> PluginResponse:
+        store = self._gacha()
+        had = bool(store.likeness_consent(group_id, owner))
+        taken_down = self._take_down_likeness(group_id, owner)
+        revoked = await self._revoke_likeness(group_id, owner)
+        if not (had or taken_down or revoked):
+            return PluginResponse.ok(text="我本来就没有照你本人的样子画你呀。")
+        text = self._line("likeness_off")
+        if taken_down:
+            text += f"（已经照你画好的 {taken_down} 张插画也撤下了，卡还在。）"
+        return PluginResponse.ok(text=text)
+
+    def _take_down_likeness(self, group_id: str, subject_id: str) -> int:
+        """撤回同意：插件这边的同意删掉，照他本人画的插画从卡上撤下、文件删掉。
+
+        全程没有 await：正在画的那张在保存前会再查一次同意，不会在这之后又挂上去。
+        """
+        store = self._gacha()
+        store.clear_likeness_consent(group_id, subject_id)
+        cards = store.likeness_art(group_id, subject_id)
+        self._forget_art(cards)
+        for card in cards:
+            store.set_art(card.card_id, "")
+        return len(cards)
+
+    async def _revoke_likeness(self, group_id: str, subject_id: str) -> int:
+        """在框架的视觉资产系统里撤回授权（排队中的取消、已画的结果隔离）。"""
+        try:
+            result = await self.ctx.engine.revoke_person_image_consent(
+                user_id=subject_id, group_id=group_id
+            )
+        except PersonImageError:
+            return 0
+        return len(result.get("revoked") or [])
+
+    def _forget_art(self, cards: list[Card]) -> None:
+        """删掉这些卡的插画文件和发到群里的那张卡面图。"""
+        folder = self.get_artifact_dir()
+        for card in cards:
+            paths = [folder / "announce" / f"{card.card_id}.png"]
+            if card.art:
+                paths.append(folder / "art" / card.art)
+            for path in paths:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    self.logger.warning("插画文件删不掉：%s", path.name)
 
     # ── 送卡、交换、升星 ──────────────────────────────────────────────
 
@@ -829,6 +929,12 @@ class GachaPlugin(PluginBase):
 
     async def _draw_awakened(self, job: dict[str, Any], base: Card) -> bool:
         group_id = job["group_id"]
+        store = self._gacha()
+        subject = base.subject_id
+        # 同意过、并且现在还在图鉴里，才试着照他本人画；有没有形象图由框架判断。
+        likeness = bool(store.likeness_consent(group_id, subject)) and (
+            subject not in store.opted_out(group_id)
+        )
         reply = await self._generate(
             "（觉醒这张卡）",
             build_awaken_prompt(
@@ -837,14 +943,23 @@ class GachaPlugin(PluginBase):
                 title=base.title,
                 skill=base.skill_name,
                 note=base.note,
+                likeness=likeness,
             ),
             group_id,
         )
         text = parse_awaken(reply)
         if text is None:
             return False
-        art = await self._paint_art(text.scene)
-        store = self._gacha()
+        note = ""
+        art: bytes | None = None
+        if likeness:
+            art, note = await self._paint_likeness(text.scene, base)
+            # 画的这几分钟里他可能撤回了：保存前再查一次（到保存都没有 await）。
+            if art is not None and not store.likeness_consent(group_id, subject):
+                art, note = None, ""
+        drew_likeness = art is not None
+        if art is None:
+            art = await self._paint_art(text.scene)
         now = _now().isoformat()
         card = store.add_card(
             group_id=group_id,
@@ -864,7 +979,7 @@ class GachaPlugin(PluginBase):
             issued=1,
             base_card=base.card_id,
         )
-        self._save_art(card, art)
+        self._save_art(card, art, likeness=drew_likeness)
         store.grant(group_id=group_id, owner_id=job["owner_id"], card_id=card.card_id, now=now)
         card = store.card(group_id, card.card_id) or card
         said = await self._say(
@@ -877,6 +992,8 @@ class GachaPlugin(PluginBase):
             group_id,
         )
         line = said or f"{job['owner_name']}，你的觉醒卡画好了：「{card.title}」。"
+        if note:
+            line += f"（这次没能照 {base.subject_name} 本人的样子画：{note}，先用象征物代替。）"
         await self._announce(
             group_id, line, card, store.owned(group_id, job["owner_id"], card.card_id)
         )
@@ -911,12 +1028,43 @@ class GachaPlugin(PluginBase):
             raise ValueError("生图没有返回图片")
         return data
 
-    def _save_art(self, card: Card, art: bytes) -> None:
+    async def _paint_likeness(self, scene: str, base: Card) -> tuple[bytes | None, str]:
+        """照卡上这个人本人的样子画：走框架的受管人物生图（同意、额度、预检、隔离都在框架）。
+
+        返回 (插画, 要如实告诉大家的原因)。没画成就是 (None, 原因)，调用方改用象征物画；
+        撤回、没同意这类本人自己的选择不用在群里说。网络之类的故障照常抛出，算一次失败。
+        """
+        try:
+            result = await self.ctx.engine.generate_person_image(
+                image_prompt(
+                    scene,
+                    persona_name=self._persona_name(),
+                    has_reference=True,
+                    likeness_name=base.subject_name,
+                ),
+                user_id=base.subject_id,
+                group_id=base.group_id,
+                persona_references=_ART_REFERENCES,
+                timeout_seconds=_ART_TIMEOUT_SECONDS,
+            )
+        except PersonImageError as exc:
+            self.logger.info("没能照本人画觉醒插画：%s", exc.code)
+            if exc.code in {"consent_required", "cancelled_by_revocation"}:
+                # 授权在框架那边已经不在了（比如在别处撤回）：插件这边的同意也作废。
+                self._gacha().clear_likeness_consent(base.group_id, base.subject_id)
+                return None, ""
+            return None, _LIKENESS_FALLBACK_NOTES.get(exc.code, "这次没法核验授权")
+        data = result.get("image_bytes") or b""
+        if not data:
+            raise ValueError("生图没有返回图片")
+        return data, ""
+
+    def _save_art(self, card: Card, art: bytes, *, likeness: bool = False) -> None:
         folder = self.get_artifact_dir() / "art"
         folder.mkdir(parents=True, exist_ok=True)
         name = f"{card.card_id}.img"
         (folder / name).write_bytes(art)
-        self._gacha().set_art(card.card_id, name)
+        self._gacha().set_art(card.card_id, name, likeness=likeness)
 
     async def _announce(self, group_id: str, text: str, card: Card, owned: Owned | None) -> None:
         """插画画好了：在群里说一声，附上新的卡面。"""

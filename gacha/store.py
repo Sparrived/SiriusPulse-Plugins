@@ -13,6 +13,10 @@
 - ``awakened``：三星卡觉醒出的超级卡（SSR），她专门为收藏者画了一张插画，只此一份。
 
 名场面和觉醒卡的插画由后台的画图任务（``art_jobs``）慢慢画，画好再挂到卡上。
+
+「画我」的同意（``likeness_consent``）只是插件这边的备忘：真正的授权记在框架的视觉资产
+系统里（``grant_id`` 指向那条授权），画的时候由框架核验。照本人形象画的插画在卡上
+标 ``art_likeness``，本人撤回同意时据此撤下。
 """
 
 from __future__ import annotations
@@ -96,6 +100,14 @@ CREATE TABLE IF NOT EXISTS art_jobs (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS likeness_consent (
+    group_id   TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    grant_id   TEXT NOT NULL,
+    at         TEXT NOT NULL,
+    PRIMARY KEY (group_id, subject_id)
+);
+
 CREATE TABLE IF NOT EXISTS offers (
     offer_id   TEXT PRIMARY KEY,
     group_id   TEXT NOT NULL,
@@ -119,6 +131,7 @@ _ADDED_COLUMNS = {
         "issued": "INTEGER NOT NULL DEFAULT 0",
         "art": "TEXT NOT NULL DEFAULT ''",
         "base_card": "TEXT NOT NULL DEFAULT ''",
+        "art_likeness": "INTEGER NOT NULL DEFAULT 0",
     },
     "owned": {
         "stars": "INTEGER NOT NULL DEFAULT 1",
@@ -164,6 +177,8 @@ class Card:
     art: str = ""
     #: 觉醒卡是从哪张卡觉醒来的。
     base_card: str = ""
+    #: 插画是不是照卡上这个人本人的形象画的（他同意了「画我」）。
+    art_likeness: bool = False
 
     @property
     def label(self) -> str:
@@ -209,6 +224,7 @@ class Card:
             issued=int(row["issued"]),
             art=row["art"],
             base_card=row["base_card"],
+            art_likeness=bool(row["art_likeness"]),
         )
 
 
@@ -366,9 +382,49 @@ class GachaStore:
                 return item.card
         return None
 
-    def set_art(self, card_id: str, name: str) -> None:
+    def set_art(self, card_id: str, name: str, *, likeness: bool = False) -> None:
+        """给卡挂上插画；``name`` 为空串就是撤下插画。"""
         with self._connect() as conn:
-            conn.execute("UPDATE cards SET art = ? WHERE card_id = ?", (name, card_id))
+            conn.execute(
+                "UPDATE cards SET art = ?, art_likeness = ? WHERE card_id = ?",
+                (name, int(bool(name) and likeness), card_id),
+            )
+
+    def likeness_art(self, group_id: str, subject_id: str) -> list[Card]:
+        """本群里照这个人本人形象画了插画的卡。"""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM cards WHERE group_id = ? AND subject_id = ? AND art != ''
+                AND art_likeness = 1""",
+                (group_id, subject_id),
+            ).fetchall()
+        return [Card.from_row(row) for row in rows]
+
+    # ── 「画我」的同意 ────────────────────────────────────────────────
+
+    def set_likeness_consent(self, group_id: str, subject_id: str, grant_id: str, now: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO likeness_consent VALUES (?, ?, ?, ?)",
+                (group_id, subject_id, grant_id, now),
+            )
+
+    def likeness_consent(self, group_id: str, subject_id: str) -> str:
+        """这个人在本群同意「画我」时那条视觉授权的编号；没同意是空串。"""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT grant_id FROM likeness_consent WHERE group_id = ? AND subject_id = ?",
+                (group_id, subject_id),
+            ).fetchone()
+        return str(row[0]) if row else ""
+
+    def clear_likeness_consent(self, group_id: str, subject_id: str) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM likeness_consent WHERE group_id = ? AND subject_id = ?",
+                (group_id, subject_id),
+            )
+        return cursor.rowcount > 0
 
     def grant(self, *, group_id: str, owner_id: str, card_id: str, now: str) -> None:
         """直接把一份卡放进某人的收藏（觉醒卡生来就是他的）。"""
@@ -487,10 +543,14 @@ class GachaStore:
 
     def opt_out(self, group_id: str, subject_id: str, now: str) -> int:
         """退出图鉴：删掉本群里画了这个人的所有卡（包括他出演的名场面），
-        连同所有人手里的那几张。返回删掉的张数。"""
+        连同所有人手里的那几张；「画我」的同意也一并删掉。返回删掉的张数。"""
         with self._connect() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO opted_out VALUES (?, ?, ?)", (group_id, subject_id, now)
+            )
+            conn.execute(
+                "DELETE FROM likeness_consent WHERE group_id = ? AND subject_id = ?",
+                (group_id, subject_id),
             )
             rows = conn.execute("SELECT * FROM cards WHERE group_id = ?", (group_id,)).fetchall()
             ids = [row["card_id"] for row in rows if Card.from_row(row).involves(subject_id)]
