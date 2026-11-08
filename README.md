@@ -8,6 +8,7 @@ External plugins for [Sirius Pulse](https://github.com/Sparrived/SiriusPulse).
 - `sub2api_monitor`: monitors Sub2API subscription listing changes and group rate multipliers, then notifies configured chats.
 - `amkr_accounts`: reads AMKR CPA/subscription account resources through `/amkr account [selector]` and channel health through `/amkr status [hours]`, sending locally rendered dashboards to the current group (all group members can query). See [AMKR Accounts](amkr_accounts/README.md).
 - `gacha`: 群友图鉴 — the persona draws collectible cards of group members from their public messages in that group; members draw with `/抽卡` on configurable refresh times (root can refresh by hand), view progress with `/图鉴`, gift/trade/star-up with `/送卡` `/交换` `/升星`, and opt out with `/我的卡 退出`; lively group moments become limited UR cards quoting what was really said. See [群友图鉴](gacha/README.md).
+- `chat_analyzer`: 群聊手帐 — `/ca daily` / `/ca weekly` turn the group's chatter into a cute landscape scrapbook (group-chat weather and temperature, a flower clock, a time-river of the day's chapters titled by the persona, member titles, best pairs, laugh moments and echo chains, topic bubbles; the weekly adds a 7-day forecast, a candy-dot calendar and a member constellation), with her diary and an optional AI illustration; daily/weekly reports are pushed at configurable times. Source data is the engine archive. See [群聊手帐](chat_analyzer/README.md).
 
 ## Installation
 
