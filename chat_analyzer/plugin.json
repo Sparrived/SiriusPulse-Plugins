@@ -2,7 +2,7 @@
   "name": "chat_analyzer",
   "display_name": "群聊手帐",
   "description": "把群聊做成可爱的横版手帐：群聊天气与群温、花朵时钟、今日剧情、称号、CP、笑点与复读、话题泡泡；周报有一周天气、糖豆日历和群友星座；她写日记，还能画一张今日一画。",
-  "version": "5.0.0",
+  "version": "5.1.0",
   "author": "sirius-chat",
   "min_framework_version": "1.3.0",
   "permissions": {
@@ -21,6 +21,8 @@
       }
     ]
   },
-  "dependencies": [],
+  "dependencies": [
+    "Pillow>=9.0.0"
+  ],
   "resources": []
 }

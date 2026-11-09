@@ -443,7 +443,7 @@ async def test_illustration_reuses_saved_partner_art_in_order(rig):
     await rig.send("/ca daily")
 
     request = rig.engine.image_requests[0]
-    assert [name for name, _ in request.reference_images] == ["standing.png"]
+    assert [name for name, _ in request.reference_images] == ["ref_1.jpg"]
     assert "第 1 张参考图是「yuki」" in request.prompt
     assert "没来过的人" not in request.prompt
     assert "yuki" in rig.engine.prompts[0]  # 她写画面时也知道 yuki 可以画进去
@@ -510,8 +510,59 @@ async def test_illustration_reference_images_are_capped(rig):
     await rig.send("/ca daily")
 
     request = rig.engine.image_requests[0]
-    assert len(request.reference_images) == 2
-    assert len([name for name, _ in request.reference_images]) == 2
+    assert len(request.reference_images) <= 4
+    assert len(request.reference_images) == 1
+    assert "拼图" in request.prompt
+    assert "不要把拼图网格" in request.prompt
+
+
+def test_collage_packs_four_people_into_one_reference_image():
+    from plugins.chat_analyzer import collage
+
+    people = [(name, _png((index * 30, 80, 160))) for index, name in enumerate(("a", "b", "c", "d"))]
+    refs = collage.build_reference_collages(people)
+
+    assert len(refs) == 1
+    assert refs[0].names == ("a", "b", "c", "d")
+    assert (refs[0].columns, refs[0].rows) == (2, 2)
+    with Image.open(io.BytesIO(refs[0].data)) as image:
+        assert image.size == (2 * collage.CELL + 3 * collage.GAP, 2 * collage.CELL + 3 * collage.GAP)
+
+    note = collage.reference_note(refs)
+    assert "左上=a" in note
+    assert "右下=d" in note
+    assert "不要把拼图网格" in note
+
+
+def test_collage_splits_five_people_and_caps_reference_images():
+    from plugins.chat_analyzer import collage
+
+    people = [(f"p{index}", _png((index * 20, 100, 180))) for index in range(5)]
+    refs = collage.build_reference_collages(people)
+
+    assert len(refs) == 2
+    assert refs[0].names == ("p0", "p1", "p2", "p3")
+    assert refs[1].names == ("p4",)
+    assert len(collage.build_reference_collages(people, max_images=1)) == 1
+
+
+def test_collage_skips_broken_image_without_shifting_positions():
+    from plugins.chat_analyzer import collage
+
+    people = [
+        ("bad", b"not an image"),
+        ("b", _png((10, 20, 30))),
+        ("c", _png((40, 50, 60))),
+        ("d", _png((70, 80, 90))),
+    ]
+    refs = collage.build_reference_collages(people)
+
+    assert len(refs) == 1
+    assert refs[0].names == ("b", "c", "d")
+    note = collage.reference_note(refs)
+    assert "左上=b" in note
+    assert "右上=c" in note
+    assert "左下=d" in note
 
 
 # ── 定时 ───────────────────────────────────────────────────────────────

@@ -255,6 +255,7 @@ def image_prompt(
     partners: Sequence[str] = (),
     story: Sequence[str] = (),
     weather: str = "",
+    reference_note: str = "",
 ) -> str:
     """交给生图模型的最终描述：她写的画面 + 必须出现的几件事 + 参考图对应关系 + 画风与边界。"""
     lines = [scene.strip()]
@@ -267,11 +268,13 @@ def image_prompt(
         refs.append(f"第 1–{persona_refs} 张参考图是「{persona}」，她的长相和服装严格按参考图")
     for offset, name in enumerate(partners, persona_refs + 1):
         refs.append(f"第 {offset} 张参考图是「{name}」，画到她时长相和服装按这张图")
-    if refs:
+    if reference_note.strip():
+        lines.append(reference_note.strip())
+    elif refs:
         lines.append("；".join(refs) + "。")
     lines.append(
         "画风：温柔可爱的日系绘本插画，奶油色纸张质感，粉色、天蓝、浅橙的柔和配色，圆润的线条，"
-        "一整页信息丰富的场景，正方形构图。群友是看不清长相的Q版小人或小动物。"
+        "一整页信息丰富的场景，正方形构图。群友是Q版小人或小动物，保留各自的发色、瞳色和标志性服饰，不要画成真人。"
         "画面中不要出现任何文字、数字、对话框里的字、真实人物的脸、号码或链接。"
     )
     return "\n".join(lines)

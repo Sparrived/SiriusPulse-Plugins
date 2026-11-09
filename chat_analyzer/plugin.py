@@ -29,16 +29,14 @@ from sirius_pulse.plugins.api import (
     group_command,
 )
 
-from . import avatars, metrics, page, partners, source, writer
+from . import avatars, collage, metrics, page, partners, source, writer
 from .source import CN_TZ
 
 logger = logging.getLogger(__name__)
 
-_VERSION = "5.0.0"
+_VERSION = "5.1.0"
 _RENDER_TIMEOUT = 90.0
 _ART_TIMEOUT = 180.0
-#: 参考图太多会把生图拖到超时：她自己的形象优先，合计最多两张。
-_MAX_ART_REFERENCES = 2
 #: 到点之后多久之内还能补发（插件重启、机器休眠时别把当天的手帐丢了）
 _CATCH_UP = timedelta(hours=2)
 _KEEP_REPORTS = 30
@@ -100,7 +98,7 @@ class ChatAnalyzerPlugin(PluginBase):
     _plugin_description = (
         "把群聊做成可爱的横版手帐：群聊天气与群温、花朵时钟、今日剧情、称号、CP、笑点与复读、" "话题泡泡，周报还有一周天气、糖豆日历和群友星座；她写日记，还能画一张今日一画。"
     )
-    _plugin_version = "5.0.0"  # 与 _VERSION 保持一致（加载器要求字面量）
+    _plugin_version = "5.1.0"  # 与 _VERSION 保持一致（加载器要求字面量）
     _plugin_author = "sirius-chat"
     _plugin_dependencies = ["playwright"]
     _plugin_nl_examples = ["看看今天的群聊日报", "出一份群聊周报", "今天群里聊了啥"]
@@ -739,7 +737,8 @@ class ChatAnalyzerPlugin(PluginBase):
     ) -> str:
         """拿一张插画（data URI）。同一群同一周期画过就复用；定时那次会重画最新的。
 
-        参考图顺序固定：先是她自己的形象图，再是这一期出现过的伙伴；提示词里按同样的顺序说明谁是谁。
+        参考图自动拼成 2×2 拼图：她自己一张 + 这一期出现过的伙伴，最多四人一张；
+        超过四人就再拼一张，总共最多四张参考图，提示词里按格子位置说明谁是谁。
         """
         if not self._option("illustration", True) or not inputs.get("scene"):
             return ""
@@ -754,25 +753,33 @@ class ChatAnalyzerPlugin(PluginBase):
         async with self._art_lock:
             if not self._take_art_quota():
                 return avatars.data_uri(cache.read_bytes()) if cache.is_file() else ""
-            own = self.ctx.engine.get_persona_reference_images(limit=2)
+            own = self.ctx.engine.get_persona_reference_images(limit=1)
             loaded = partners.read_references(friends)
-            budget = max(0, _MAX_ART_REFERENCES - len(own))
-            if len(loaded) > budget:
-                logger.info(
-                    "群聊手帐插画参考图裁剪: 伙伴 %d 张 -> %d 张（她自己 %d 张）",
-                    len(loaded),
-                    budget,
-                    len(own),
-                )
-                loaded = loaded[:budget]
-            references = [*own, *(image for _name, image in loaded)]
+            people: list[tuple[str, bytes]] = []
+            if own:
+                people.append((persona, own[0][1]))
+            people.extend((name, data) for name, (_filename, data) in loaded)
+            try:
+                collages = collage.build_reference_collages(people)
+            except Exception as exc:  # noqa: BLE001 - 拼图失败就退回无参考图生图
+                logger.warning("群聊手帐参考图拼图失败: %s", type(exc).__name__)
+                collages = []
+            references = [
+                (f"ref_{index}.jpg", item.data)
+                for index, item in enumerate(collages, 1)
+            ]
+            note = collage.reference_note(collages)
+            logger.info(
+                "群聊手帐拼图参考: %d 人 -> %d 张图", len(people), len(references)
+            )
             prompt = writer.image_prompt(
                 inputs["scene"],
                 persona=persona,
-                persona_refs=len(own),
-                partners=[name for name, _image in loaded],
+                persona_refs=0,
+                partners=[],
                 story=inputs["story"],
                 weather=inputs["weather"],
+                reference_note=note,
             )
             logger.info(
                 "群聊手帐插画请求: %d 字, %d 张参考图", len(prompt), len(references)
