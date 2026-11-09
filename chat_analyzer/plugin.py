@@ -36,7 +36,9 @@ logger = logging.getLogger(__name__)
 
 _VERSION = "5.0.0"
 _RENDER_TIMEOUT = 90.0
-_ART_TIMEOUT = 150.0
+_ART_TIMEOUT = 180.0
+#: 参考图太多会把生图拖到超时：她自己的形象优先，合计最多两张。
+_MAX_ART_REFERENCES = 2
 #: 到点之后多久之内还能补发（插件重启、机器休眠时别把当天的手帐丢了）
 _CATCH_UP = timedelta(hours=2)
 _KEEP_REPORTS = 30
@@ -706,9 +708,23 @@ class ChatAnalyzerPlugin(PluginBase):
         ledger = store.get("art_ledger") or {}
         used = int(ledger.get("count", 0)) if ledger.get("date") == today else 0
         if used >= limit:
+            logger.info("群聊手帐插画额度已用完: %d/%d（%s），本次跳过", used, limit, today)
             return False
         store.set("art_ledger", {"date": today, "count": used + 1})
         return True
+
+    def _refund_art_quota(self) -> None:
+        """生图失败时把刚占用的额度退回去，别让一次超时吃掉当天次数。"""
+        try:
+            store = self.get_data_store()
+        except RuntimeError:
+            return
+        today = _now().strftime("%Y-%m-%d")
+        ledger = store.get("art_ledger") or {}
+        if ledger.get("date") != today:
+            return
+        used = max(0, int(ledger.get("count", 0)) - 1)
+        store.set("art_ledger", {"date": today, "count": used})
 
     async def _art(
         self,
@@ -740,6 +756,15 @@ class ChatAnalyzerPlugin(PluginBase):
                 return avatars.data_uri(cache.read_bytes()) if cache.is_file() else ""
             own = self.ctx.engine.get_persona_reference_images(limit=2)
             loaded = partners.read_references(friends)
+            budget = max(0, _MAX_ART_REFERENCES - len(own))
+            if len(loaded) > budget:
+                logger.info(
+                    "群聊手帐插画参考图裁剪: 伙伴 %d 张 -> %d 张（她自己 %d 张）",
+                    len(loaded),
+                    budget,
+                    len(own),
+                )
+                loaded = loaded[:budget]
             references = [*own, *(image for _name, image in loaded)]
             prompt = writer.image_prompt(
                 inputs["scene"],
@@ -748,6 +773,9 @@ class ChatAnalyzerPlugin(PluginBase):
                 partners=[name for name, _image in loaded],
                 story=inputs["story"],
                 weather=inputs["weather"],
+            )
+            logger.info(
+                "群聊手帐插画请求: %d 字, %d 张参考图", len(prompt), len(references)
             )
             try:
                 result = await asyncio.wait_for(
@@ -759,13 +787,21 @@ class ChatAnalyzerPlugin(PluginBase):
                     _ART_TIMEOUT + 10,
                 )
             except Exception as exc:  # noqa: BLE001 - 画不出来就贴天气
+                self._refund_art_quota()
                 logger.warning("群聊手帐插画失败: %s", type(exc).__name__)
                 return avatars.data_uri(cache.read_bytes()) if cache.is_file() else ""
         data = (result or {}).get("image_bytes") or b""
         uri = avatars.data_uri(data)
-        if uri:
+        if not uri:
+            self._refund_art_quota()
+            logger.warning("群聊手帐插画返回空图，已退回额度")
+            return avatars.data_uri(cache.read_bytes()) if cache.is_file() else ""
+        try:
             folder.mkdir(parents=True, exist_ok=True)
             cache.write_bytes(data)
+        except OSError as exc:  # 缓存写不进去也不该拖垮整张手帐
+            logger.warning("群聊手帐插画缓存写入失败: %s", exc)
+        logger.info("群聊手帐插画完成: %s/%s（%d 字节）", kind, group_id, len(data))
         return uri
 
     # ── 文字版（出图失败时）────────────────────────────────────────────

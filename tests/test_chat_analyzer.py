@@ -461,6 +461,59 @@ async def test_illustration_can_be_turned_off_or_capped(rig, settings):
     assert "今日一画" not in rig.pages[0]
 
 
+@pytest.mark.asyncio
+async def test_illustration_quota_stops_after_limit(rig):
+    rig.settings = {"art_per_day": 1}
+
+    await rig.send("/ca daily")
+    await rig.send("/ca weekly")
+
+    assert len(rig.engine.image_prompts) == 1
+    assert "今日一画" in rig.pages[0]
+    assert "本周一画" not in rig.pages[1]
+
+
+@pytest.mark.asyncio
+async def test_illustration_quota_is_refunded_when_generation_fails(rig):
+    instance = await rig.plugin()
+    rig.settings = {"art_per_day": 1}
+    original = rig.engine.brain.generate_image_async
+
+    async def fail(_request):
+        raise RuntimeError("timeout")
+
+    rig.engine.brain.generate_image_async = fail
+    await rig.send("/ca daily")
+
+    assert instance.get_data_store().get("art_ledger")["count"] == 0
+    assert "今日一画" not in rig.pages[0]
+
+    rig.engine.brain.generate_image_async = original
+    await rig.send("/ca daily")
+
+    assert len(rig.engine.image_prompts) == 1
+    assert "今日一画" in rig.pages[1]
+
+
+@pytest.mark.asyncio
+async def test_illustration_reference_images_are_capped(rig):
+    folder = rig.engine.work_path / "bot_assets"
+    index = {}
+    for key, name in (("a", "小明"), ("b", "阿离"), ("c", "雀雀"), ("d", "糖糖")):
+        (folder / key).mkdir(parents=True)
+        (folder / key / "standing.png").write_bytes(_png())
+        index[key] = {"name": name}
+    (folder / "index.json").write_text(
+        json.dumps(index, ensure_ascii=False), encoding="utf-8"
+    )
+
+    await rig.send("/ca daily")
+
+    request = rig.engine.image_requests[0]
+    assert len(request.reference_images) == 2
+    assert len([name for name, _ in request.reference_images]) == 2
+
+
 # ── 定时 ───────────────────────────────────────────────────────────────
 
 
