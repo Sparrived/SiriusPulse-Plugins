@@ -28,8 +28,9 @@ from sirius_pulse.plugins.api import (
     command_group,
     group_command,
 )
+from sirius_pulse.visual.collage import build_reference_collages, reference_note
 
-from . import avatars, collage, metrics, page, partners, source, writer
+from . import avatars, metrics, page, partners, source, writer
 from .source import CN_TZ
 
 logger = logging.getLogger(__name__)
@@ -760,7 +761,7 @@ class ChatAnalyzerPlugin(PluginBase):
                 people.append((persona, own[0][1]))
             people.extend((name, data) for name, (_filename, data) in loaded)
             try:
-                collages = collage.build_reference_collages(people)
+                collages = build_reference_collages(people)
             except Exception as exc:  # noqa: BLE001 - 拼图失败就退回无参考图生图
                 logger.warning("群聊手帐参考图拼图失败: %s", type(exc).__name__)
                 collages = []
@@ -768,7 +769,7 @@ class ChatAnalyzerPlugin(PluginBase):
                 (f"ref_{index}.jpg", item.data)
                 for index, item in enumerate(collages, 1)
             ]
-            note = collage.reference_note(collages)
+            note = reference_note(collages)
             logger.info(
                 "群聊手帐拼图参考: %d 人 -> %d 张图", len(people), len(references)
             )
