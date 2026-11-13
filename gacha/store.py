@@ -14,6 +14,10 @@
 
 名场面和觉醒卡的插画由后台的画图任务（``art_jobs``）慢慢画，画好再挂到卡上。
 
+被画的人也该知道自己被谁收藏了：``collectors`` 按人汇总谁手里有他的卡，
+``fan_marks`` 记下已经告诉过他的里程碑（第一次被收藏、第 N 个收藏家、头号收藏家
+换人、被升到满星），每个只说一次；``quiet`` 是不想被 @ 的人。
+
 「画我」的同意（``likeness_consent``）只是插件这边的备忘：真正的授权记在框架的视觉资产
 系统里（``grant_id`` 指向那条授权），画的时候由框架核验。照本人形象画的插画在卡上
 标 ``art_likeness``，本人撤回同意时据此撤下。
@@ -116,6 +120,21 @@ CREATE TABLE IF NOT EXISTS likeness_consent (
     PRIMARY KEY (group_id, subject_id)
 );
 
+CREATE TABLE IF NOT EXISTS fan_marks (
+    group_id   TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    mark       TEXT NOT NULL,
+    at         TEXT NOT NULL,
+    PRIMARY KEY (group_id, subject_id, mark)
+);
+
+CREATE TABLE IF NOT EXISTS quiet (
+    group_id   TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    at         TEXT NOT NULL,
+    PRIMARY KEY (group_id, subject_id)
+);
+
 CREATE TABLE IF NOT EXISTS offers (
     offer_id   TEXT PRIMARY KEY,
     group_id   TEXT NOT NULL,
@@ -144,6 +163,10 @@ _ADDED_COLUMNS = {
     "owned": {
         "stars": "INTEGER NOT NULL DEFAULT 1",
         "notes": "TEXT NOT NULL DEFAULT '[]'",
+    },
+    # 收藏家的名字（最近一次在群里用的称呼），给被画的人看"谁收藏了你"。
+    "players": {
+        "name": "TEXT NOT NULL DEFAULT ''",
     },
 }
 
@@ -263,6 +286,18 @@ class Owned:
     copies: int
     stars: int = 1
     notes: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class Collector:
+    """一位收藏家手里有某个人的哪些卡（常驻卡、心情卡、觉醒卡合计）。"""
+
+    owner_id: str
+    name: str
+    copies: int
+    stars: int
+    awakened: bool
+    first_at: str
 
 
 @dataclass(slots=True)
@@ -594,10 +629,11 @@ class GachaStore:
             conn.execute(
                 "INSERT OR REPLACE INTO opted_out VALUES (?, ?, ?)", (group_id, subject_id, now)
             )
-            conn.execute(
-                "DELETE FROM likeness_consent WHERE group_id = ? AND subject_id = ?",
-                (group_id, subject_id),
-            )
+            for table in ("likeness_consent", "fan_marks"):
+                conn.execute(
+                    f"DELETE FROM {table} WHERE group_id = ? AND subject_id = ?",
+                    (group_id, subject_id),
+                )
             rows = conn.execute("SELECT * FROM cards WHERE group_id = ?", (group_id,)).fetchall()
             ids = [row["card_id"] for row in rows if Card.from_row(row).involves(subject_id)]
             for card_id in ids:
@@ -648,6 +684,7 @@ class GachaStore:
         period: datetime,
         pity_after: int,
         now: str,
+        name: str = "",
     ) -> int:
         """一次抽卡：扣当天次数、更新保底、把卡放进收藏。返回这张卡现在有几份。
 
@@ -667,14 +704,16 @@ class GachaStore:
             ).fetchone()
             used = int(row["draws_today"]) if row and in_period(row["draw_date"], period) else 0
             conn.execute(
-                """INSERT INTO players (group_id, owner_id, draw_date, draws_today, total, pity)
-                VALUES (?, ?, ?, ?, 1, ?)
+                """INSERT INTO players
+                    (group_id, owner_id, draw_date, draws_today, total, pity, name)
+                VALUES (?, ?, ?, ?, 1, ?, ?)
                 ON CONFLICT (group_id, owner_id) DO UPDATE SET
                     draw_date = excluded.draw_date,
                     draws_today = excluded.draws_today,
                     total = total + 1,
-                    pity = excluded.pity""",
-                (group_id, owner_id, now, used + 1, pity_after),
+                    pity = excluded.pity,
+                    name = CASE WHEN excluded.name != '' THEN excluded.name ELSE name END""",
+                (group_id, owner_id, now, used + 1, pity_after, name),
             )
             _give(conn, group_id, owner_id, card.card_id, now)
             copies = conn.execute(
@@ -682,6 +721,86 @@ class GachaStore:
                 (group_id, owner_id, card.card_id),
             ).fetchone()[0]
         return int(copies)
+
+    def remember_name(self, group_id: str, owner_id: str, name: str) -> None:
+        """记下一位收藏家现在的称呼（收到别人送的卡、但自己从没抽过的人也要有名字）。"""
+        if not name:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO players (group_id, owner_id, name) VALUES (?, ?, ?)
+                ON CONFLICT (group_id, owner_id) DO UPDATE SET name = excluded.name""",
+                (group_id, owner_id, name),
+            )
+
+    # ── 被画的人：谁收藏了我 ──────────────────────────────────────────
+
+    def collectors(self, group_id: str, subject_id: str) -> list[Collector]:
+        """谁手里有画着这个人的卡（不算他自己，也不算名场面），头号收藏家排第一。
+
+        排序：觉醒过他的卡 > 星级高 > 份数多 > 收得早。
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT owned.owner_id AS owner_id,
+                    SUM(owned.copies) AS copies,
+                    MAX(owned.stars) AS stars,
+                    MAX(cards.kind = 'awakened') AS awakened,
+                    MIN(owned.first_at) AS first_at,
+                    COALESCE(MAX(players.name), '') AS name
+                FROM owned
+                JOIN cards ON cards.card_id = owned.card_id
+                LEFT JOIN players
+                    ON players.group_id = owned.group_id AND players.owner_id = owned.owner_id
+                WHERE owned.group_id = ? AND cards.subject_id = ? AND owned.owner_id != ?
+                    AND cards.kind IN ('member', 'mood', 'awakened')
+                GROUP BY owned.owner_id""",
+                (group_id, subject_id, subject_id),
+            ).fetchall()
+        fans = [
+            Collector(
+                owner_id=row["owner_id"],
+                name=row["name"],
+                copies=int(row["copies"]),
+                stars=int(row["stars"]),
+                awakened=bool(row["awakened"]),
+                first_at=row["first_at"],
+            )
+            for row in rows
+        ]
+        fans.sort(key=lambda fan: (-fan.awakened, -fan.stars, -fan.copies, fan.first_at))
+        return fans
+
+    def claim_mark(self, group_id: str, subject_id: str, mark: str, now: str) -> bool:
+        """这个里程碑以前没告诉过他：记下来并返回 True；说过了返回 False。"""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO fan_marks VALUES (?, ?, ?, ?)",
+                (group_id, subject_id, mark, now),
+            )
+        return cursor.rowcount > 0
+
+    def set_quiet(self, group_id: str, subject_id: str, quiet: bool, now: str) -> bool:
+        """不想被 @（或者又想了）。返回状态有没有变。"""
+        with self._connect() as conn:
+            if quiet:
+                cursor = conn.execute(
+                    "INSERT OR IGNORE INTO quiet VALUES (?, ?, ?)", (group_id, subject_id, now)
+                )
+            else:
+                cursor = conn.execute(
+                    "DELETE FROM quiet WHERE group_id = ? AND subject_id = ?",
+                    (group_id, subject_id),
+                )
+        return cursor.rowcount > 0
+
+    def is_quiet(self, group_id: str, subject_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM quiet WHERE group_id = ? AND subject_id = ?",
+                (group_id, subject_id),
+            ).fetchone()
+        return row is not None
 
     def collection(self, group_id: str, owner_id: str) -> list[Owned]:
         with self._connect() as conn:

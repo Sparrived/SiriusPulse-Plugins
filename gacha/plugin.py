@@ -14,6 +14,11 @@
 卡都在后台慢慢画（每次心跳、每天都有上限），只在有人玩过的群里画；插画由另一个
 后台任务一张张画，画好了她在群里叫人。
 
+**被画的人**：有人收藏了你的卡，她会告诉你——第一次被收藏、第 3/5/10/20 个收藏家、
+头号收藏家换人、你的卡被谁升到满星，每个里程碑只说一次，并在回复里 @ 你（每人每天
+最多被 @ 一次，``/我的卡 别叫我`` 可以关掉）。``/我的卡`` 的卡面底下写着谁收藏了你，
+``/我的卡 收藏家`` 看名单。
+
 **画我**：插画里默认没有真实的人。卡上的人自己发 ``/我的卡 画我`` 同意、并且在框架的
 视觉资产系统里登记了形象图，他的觉醒卡插画才照他本人的样子画——同意记成视觉资产
 授权，画的时候走框架的受管人物生图入口（授权、额度、预检、隔离都在框架里）。
@@ -28,11 +33,12 @@ import random
 import time
 from collections import deque
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from sirius_pulse.adapters.models import ImageSegment, MessageGroup, TextSegment
+from sirius_pulse.adapters.models import AtSegment, ImageSegment, MessageGroup, TextSegment
 from sirius_pulse.extension_runtime import BackgroundTaskSpec
 from sirius_pulse.plugins.api import (
     CommandAST,
@@ -59,6 +65,7 @@ from .store import (
     KIND_MOOD,
     MAX_STARS,
     Card,
+    Collector,
     GachaStore,
     Owned,
     SoldOut,
@@ -129,6 +136,8 @@ _HELP_SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
     (
         "关于你",
         [
+            ("/我的卡 收藏家", "看谁收藏了你的卡、谁是你的头号收藏家"),
+            ("/我的卡 别叫我 / 叫我", "有人收藏你时我会 @ 你，不想被叫就关掉"),
             ("/我的卡 退出 / 加入", "不想被画进图鉴就退出，想回来再加入"),
             ("/我的卡 画我 / 不画我", "同意或撤回：觉醒插画照你本人登记的形象画你"),
         ],
@@ -160,7 +169,9 @@ _USAGE = {
         block=True,
     ),
     "mine": must(
-        "用法：/我的卡、/我的卡 退出、/我的卡 加入、/我的卡 画我、/我的卡 不画我",
+        "用法：/我的卡、/我的卡 收藏家、/我的卡 别叫我、/我的卡 叫我、" "/我的卡 退出、/我的卡 加入、/我的卡 画我、/我的卡 不画我",
+        "/我的卡 收藏家",
+        "/我的卡 别叫我",
         "/我的卡 退出",
         "/我的卡 加入",
         "/我的卡 画我",
@@ -168,6 +179,11 @@ _USAGE = {
         block=True,
     ),
 }
+#: 收藏家人数到这些时告诉被画的人一声。
+_FAN_COUNTS = (3, 5, 10, 20)
+#: /我的卡 收藏家 最多列几位。
+_FAN_LIST = 5
+
 #: 她现场说一句最多等这么久，超时就用台词本。
 _LIVE_TIMEOUT_SECONDS = 25.0
 
@@ -197,7 +213,7 @@ class GachaPlugin(PluginBase):
     _plugin_name = "gacha"
     _plugin_display_name = "群友图鉴"
     _plugin_description = "她给群友画收藏卡：/抽卡 每天一抽，/图鉴 看收集进度，/送卡 /交换 /升星 /觉醒，" "/我的卡 退出 随时不再入画。"
-    _plugin_version = "0.5.1"
+    _plugin_version = "0.6.0"
     _plugin_author = "Sirius Pulse"
     _plugin_min_framework_version = "1.3.0"
     _plugin_dependencies = ["httpx>=0.24.0", "Pillow>=9.0.0"]
@@ -501,6 +517,7 @@ class GachaPlugin(PluginBase):
                     period=period,
                     pity_after=result.pity_after,
                     now=_now().isoformat(),
+                    name=self._collector_name(),
                 )
                 break
             except SoldOut:
@@ -531,6 +548,8 @@ class GachaPlugin(PluginBase):
             values = {"name": card.name, "title": card.title, "rarity": card.rarity}
         else:
             occasion, values = "draw_new", {"name": card.name, "title": card.title}
+        news = self._fan_news(group_id, card, owner, self._speaker_name())
+        facts += news.facts
         text = await self._speak(
             occasion,
             group_id=group_id,
@@ -540,7 +559,9 @@ class GachaPlugin(PluginBase):
             **values,
         )
         return self._image(
-            text, await self._render(card, store.owned(group_id, owner, card.card_id))
+            text,
+            await self._render(card, store.owned(group_id, owner, card.card_id)),
+            mention=news.mention,
         )
 
     # ── 刷新 ──────────────────────────────────────────────────────────
@@ -667,6 +688,14 @@ class GachaPlugin(PluginBase):
             return await self._consent_likeness(group_id, owner)
         if action in {"不画我", "别画我"}:
             return await self._withdraw_likeness(group_id, owner)
+        if action in {"收藏家", "粉丝", "谁收藏了我"}:
+            return await self._fans(group_id, owner)
+        if action in {"别叫我", "安静", "别艾特我"}:
+            store.set_quiet(group_id, owner, True, now)
+            return await self._reply(group_id, "quiet_on", musts=[_UNQUIET])
+        if action in {"叫我", "艾特我"}:
+            store.set_quiet(group_id, owner, False, now)
+            return await self._reply(group_id, "quiet_off")
         if action:
             return await self._reply(group_id, "mine_usage", musts=[_USAGE["mine"]])
         if owner in store.opted_out(group_id):
@@ -678,14 +707,50 @@ class GachaPlugin(PluginBase):
             return await self._reply(group_id, "no_card_yet")
         facts = [f"你在卡角写给他的批注是「{card.note}」"] if card.note else []
         musts = []
+        fans = store.collectors(group_id, owner)
+        if fans:
+            facts.append(
+                f"有 {len(fans)} 个人收藏了你给他画的卡，头号收藏家是 {_fan_name(fans[0])}" f"（{_fan_detail(fans[0])}）"
+            )
+            musts.append(must(f"{len(fans)} 个人收藏了你", f"{len(fans)} 个人"))
+        else:
+            facts.append("还没有人抽到过他的卡")
         if store.likeness_consent(group_id, owner):
             facts.append("他同意过觉醒插画照他本人的样子画")
             musts.append(must("/我的卡 不画我 可以撤回", "/我的卡 不画我"))
         text = await self._speak(
             "mine_card", group_id=group_id, facts=facts, musts=musts, title=card.title
         )
+        strip = f"被 {len(fans)} 人收藏 · 头号收藏家 {_fan_name(fans[0])[:8]}" if fans else "还没有人收藏你"
         return self._image(
-            text, await self._render(card, store.owned(group_id, owner, card.card_id))
+            text,
+            await self._render(card, store.owned(group_id, owner, card.card_id), fans=strip),
+        )
+
+    async def _fans(self, group_id: str, owner: str) -> PluginResponse:
+        """/我的卡 收藏家：谁收藏了你，头号收藏家排第一。"""
+        store = self._gacha()
+        if owner in store.opted_out(group_id):
+            return await self._reply(
+                group_id, "mine_opted_out", musts=[must("想回来发 /我的卡 加入", "/我的卡 加入")]
+            )
+        fans = store.collectors(group_id, owner)
+        if not fans:
+            return await self._reply(group_id, "fans_none")
+        rows = [
+            f"{index}. {_fan_name(fan)}：{_fan_detail(fan)}"
+            for index, fan in enumerate(fans[:_FAN_LIST], 1)
+        ]
+        if len(fans) > _FAN_LIST:
+            rows.append(f"……还有 {len(fans) - _FAN_LIST} 位")
+        listing = must("\n".join(rows), *(_fan_name(fan) for fan in fans[:_FAN_LIST]), block=True)
+        return await self._reply(
+            group_id,
+            "fans_list",
+            facts=[f"头号收藏家 {_fan_name(fans[0])}：{_fan_detail(fans[0])}"],
+            musts=[listing],
+            count=len(fans),
+            top=_fan_name(fans[0]),
         )
 
     # ── 画我：同意与撤回 ──────────────────────────────────────────────
@@ -789,7 +854,16 @@ class GachaPlugin(PluginBase):
             card_id=item.card.card_id,
             now=_now().isoformat(),
         )
-        return await self._reply(group_id, "gift_done", card=_label(item.card), to=target[1])
+        store.remember_name(group_id, target[0], target[1])
+        news = self._fan_news(group_id, item.card, target[0], target[1])
+        text = await self._speak(
+            "gift_done",
+            group_id=group_id,
+            facts=news.facts,
+            card=_label(item.card),
+            to=target[1],
+        )
+        return self._message(text, mention=news.mention)
 
     async def _trade(self, group_id: str, args: list[str]) -> PluginResponse:
         args = [arg for arg in args if arg != "换"]
@@ -897,15 +971,30 @@ class GachaPlugin(PluginBase):
         if not stars:
             return await self._reply(group_id, "star_failed")
         upgraded = self._gacha().owned(group_id, owner, card.card_id)
+        news = _FanNews()
+        if stars >= MAX_STARS:
+            news = self._fan_news(
+                group_id,
+                card,
+                owner,
+                self._speaker_name(),
+                extra=[
+                    (
+                        f"maxed:{owner}:{card.card_id}",
+                        f"{self._speaker_name()} 把画着 {card.subject_name} 的这张卡升到了满星",
+                    )
+                ],
+            )
         text = await self._speak(
             "star_done",
             group_id=group_id,
+            facts=news.facts,
             musts=[must(f"悄悄话：{note}", note)],
             card=card.label,
             stars=stars,
             note=note,
         )
-        return self._image(text, await self._render(card, upgraded))
+        return self._image(text, await self._render(card, upgraded), mention=news.mention)
 
     # ── 觉醒：三星卡变成她专门画的超级卡 ──────────────────────────────
 
@@ -1230,6 +1319,10 @@ class GachaPlugin(PluginBase):
             musts.append(must(f"这次没能照 {base.subject_name} 本人的样子画：{note}，先用象征物代替", note))
         elif drew_likeness:
             facts.append(f"这张插画是照 {base.subject_name} 本人登记的样子画的")
+        if base.subject_id != job["owner_id"] and not store.is_quiet(group_id, base.subject_id):
+            facts.append(
+                f"卡上画的是 {base.subject_name}：他的卡被 {job['owner_name'] or '一位群友'} " "觉醒了，顺便也告诉他一声"
+            )
         line = await self._speak(
             "awaken_ready",
             group_id=group_id,
@@ -1333,6 +1426,67 @@ class GachaPlugin(PluginBase):
             image_path=str(path),
             event_id=f"gacha-art:{card.card_id}",
         )
+
+    # ── 被画的人：有人收藏了你 ────────────────────────────────────────
+
+    def _fan_news(
+        self,
+        group_id: str,
+        card: Card,
+        collector_id: str,
+        collector_name: str,
+        *,
+        extra: Sequence[tuple[str, str]] = (),
+    ) -> "_FanNews":
+        """有人刚收下一张画着别人的卡：看看卡上的人有没有该知道的新鲜事。
+
+        里程碑（第一次被收藏、第 N 个收藏家、头号收藏家换人、被升到满星）每个只说一次；
+        说的时候 @ 他，除非他说过别叫他、今天已经叫过他了，或者没有平台账号。
+        """
+        subject = card.subject_id
+        if card.kind not in {KIND_MEMBER, KIND_MOOD} or not subject or subject == collector_id:
+            return _FanNews()
+        store = self._gacha()
+        fans = store.collectors(group_id, subject)
+        who = collector_name or "一位群友"
+        candidates = list(extra)
+        if len(fans) == 1:
+            candidates.append(("first", f"这是 {card.subject_name} 的卡第一次被人收进图鉴，第一个收藏他的就是 {who}"))
+        if len(fans) in _FAN_COUNTS:
+            candidates.append((f"fans_{len(fans)}", f"{card.subject_name} 的卡已经有 {len(fans)} 个人收藏了"))
+        if len(fans) >= 2 and fans[0].owner_id == collector_id:
+            candidates.append((f"top:{collector_id}", f"{who} 刚成了 {card.subject_name} 的头号收藏家"))
+        now = _now().isoformat()
+        fresh = [
+            fact for mark, fact in candidates if store.claim_mark(group_id, subject, mark, now)
+        ]
+        if not fresh:
+            return _FanNews()
+        mention = self._may_ping(group_id, subject, card.subject_uid)
+        how = (
+            f"系统会在你的话前面 @ {card.subject_name}，你可以同时跟他和收卡的人说话"
+            if mention
+            else f"顺口提一句 {card.subject_name} 就好"
+        )
+        return _FanNews(facts=[*fresh, how], mention=mention)
+
+    def _may_ping(self, group_id: str, subject_id: str, uid: str) -> str:
+        """能不能 @ 他：没说过别叫他、今天还没叫过、有平台账号。能就记下今天叫过了。"""
+        if not uid.isdigit() or self._gacha().is_quiet(group_id, subject_id):
+            return ""
+        data = self.get_data_store()
+        pings = dict(data.get("fan_pings") or {})
+        key, today = f"{group_id}:{subject_id}", local_today(_now())
+        if pings.get(key) == today:
+            return ""
+        pings = {k: v for k, v in pings.items() if v == today}  # 只留今天的，账本不会越记越长
+        pings[key] = today
+        data.set("fan_pings", pings)
+        return uid
+
+    def _collector_name(self) -> str:
+        name = str(self.ctx.message.speaker_name or "").strip()
+        return name
 
     # ── 她的声音 ──────────────────────────────────────────────────────
 
@@ -1489,7 +1643,7 @@ class GachaPlugin(PluginBase):
             value = default
         return max(low, min(high, value))
 
-    async def _render(self, card: Card, owned: Owned | None = None) -> bytes:
+    async def _render(self, card: Card, owned: Owned | None = None, *, fans: str = "") -> bytes:
         avatar = await self._avatar(card.subject_uid)
         art = None
         if card.art:
@@ -1505,6 +1659,7 @@ class GachaPlugin(PluginBase):
             stars=owned.stars if owned else 1,
             extra_notes=owned.notes if owned else [],
             art=art,
+            fans=fans,
         )
 
     async def _avatar(self, uid: str) -> bytes | None:
@@ -1528,14 +1683,53 @@ class GachaPlugin(PluginBase):
         return data
 
     @staticmethod
-    def _image(text: str, png: bytes) -> PluginResponse:
+    def _message(text: str, *, mention: str = "") -> PluginResponse:
+        """纯文字回复；要 @ 被画的人时放进消息本身。"""
+        if not mention:
+            return PluginResponse.ok(text=text)
+        return PluginResponse.ok(
+            text=text,
+            message_group=MessageGroup([AtSegment(mention), TextSegment(" " + text)]),
+            render_mode="direct",
+        )
+
+    @staticmethod
+    def _image(text: str, png: bytes, *, mention: str = "") -> PluginResponse:
         # 有 message_group 时宿主只发它、不再发 text，所以台词要放进消息本身。
         image = ImageSegment(file_path="base64://" + base64.b64encode(png).decode("ascii"))
+        if mention:
+            return PluginResponse.ok(
+                text=text,
+                message_group=MessageGroup([AtSegment(mention), TextSegment(" " + text), image]),
+                render_mode="direct",
+            )
         return PluginResponse.ok(
             text=text,
             message_group=MessageGroup([TextSegment(text), image]),
             render_mode="direct",
         )
+
+
+@dataclass(slots=True)
+class _FanNews:
+    """卡上的人该知道的事：告诉她的几条事实，以及要 @ 的平台账号（空就不 @）。"""
+
+    facts: list[str] = field(default_factory=list)
+    mention: str = ""
+
+
+_UNQUIET = must("想让我再叫你，发 /我的卡 叫我", "/我的卡 叫我")
+
+
+def _fan_name(fan: Collector) -> str:
+    return fan.name or "一位群友"
+
+
+def _fan_detail(fan: Collector) -> str:
+    parts = [f"{fan.copies} 份", "★" * fan.stars]
+    if fan.awakened:
+        parts.append("觉醒过")
+    return "，".join(parts)
 
 
 def _when(schedule: Schedule) -> dict[str, str]:

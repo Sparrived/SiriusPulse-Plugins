@@ -1329,3 +1329,53 @@ def test_cute_font_falls_back_when_it_lacks_kana():
     fallback = _font_for("なのだ", 30, cute=True)
     assert _glyph_supported(fallback, "な")
     assert fallback.path != cute.path
+
+
+# --- 被画的人：有人收藏了你 -------------------------------------------------------
+
+
+def _ats(chat) -> list[str]:
+    """真正发到群里的 @。"""
+    return [seg["data"]["qq"] for msg in chat.sent for seg in msg if seg["type"] == "at"]
+
+
+@pytest.mark.asyncio
+async def test_the_person_on_the_card_hears_when_people_collect_them(chat):
+    # 卡上的人在群里说过话，她认得他的 QQ 号，才能 @ 到他。
+    chat.engine.say(GROUP, "u-ming", "今天也要早睡")
+    plugin = await _three_cards(chat)  # 新来的抽走了阿明 No.001
+    assert _ats(chat) == ["10001"], "阿明的卡第一次被收藏：@ 阿明"
+    assert "第一次被人收进图鉴" in _spoken(chat)[-1] and "新来的" in _spoken(chat)[-1]
+
+    # 同一天又到了一个里程碑（第 3 个收藏家）：她照样提，但一天只 @ 他一次。
+    _grant(plugin, "u-hong", 1, copies=2)
+    chat.clock[0] += timedelta(hours=1)
+    await chat.send("/送卡 老王 1", user="u-hong")
+    assert _ats(chat) == [] and "已经有 3 个人收藏了" in _spoken(chat)[-1]
+
+    # 阿明说别叫他：第二天老王成了头号收藏家，她只在回复里提一句，不 @。
+    await chat.send("/我的卡 别叫我", user="u-ming")
+    assert "/我的卡 叫我" in chat.said()
+    chat.clock[0] += timedelta(days=1)
+    await chat.send("/送卡 老王 1", user="u-hong")
+    assert _ats(chat) == [] and "老王 刚成了 阿明 的头号收藏家" in _spoken(chat)[-1]
+
+    # 没有新的里程碑就不提他。
+    await chat.send("/送卡 小红 1", user="u-wang")
+    assert "阿明" not in _spoken(chat)[-1].split("现在的情况")[1]
+
+    # 阿明看自己的卡：卡面底下写着谁收藏了他；名单里头号收藏家排第一，没有他自己。
+    await chat.send("/我的卡", user="u-ming")
+    assert "3 个人" in chat.said()
+    assert "被 3 人收藏 · 头号收藏家 新来的" in chat.drawn
+    await chat.send("/我的卡 收藏家", user="u-ming")
+    listing = chat.said()
+    assert "1. 新来的" in listing and "小红" in listing and "老王" in listing
+    assert "阿明：" not in listing
+
+    # 又想被叫了：小红收下老王送的那张、成了头号收藏家，这回 @ 他。
+    await chat.send("/我的卡 叫我", user="u-ming")
+    chat.clock[0] += timedelta(days=1)
+    _grant(plugin, "u-hong", 1, copies=1)
+    await chat.send("/送卡 小红 1", user="u-new")
+    assert _ats(chat) == ["10001"] and "小红 刚成了 阿明 的头号收藏家" in _spoken(chat)[-1]

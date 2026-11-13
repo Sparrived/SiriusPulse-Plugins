@@ -21,6 +21,8 @@ from .store import KIND_AWAKENED, KIND_MOMENT, KIND_MOOD, MAX_STARS, Card, Owned
 CARD_W, CARD_H = 600, 900
 #: 插画卡比普通卡高出的部分，全部给主图。
 _ART_LIFT = 120
+#: 被画的人看自己那张卡时，底部"谁收藏了你"那一条的高度。
+_FANS_H = 40
 
 _NIGHT_TOP = (22, 30, 56)
 _NIGHT_BOTTOM = (46, 58, 99)
@@ -183,8 +185,12 @@ def render_card(
     stars: int = 1,
     extra_notes: list[str] | None = None,
     art: bytes | None = None,
+    fans: str = "",
 ) -> bytes:
-    """一张收藏卡（600 宽）。升过星的卡会多出她写给收藏者的话，卡也跟着变长。"""
+    """一张收藏卡（600 宽）。升过星的卡会多出她写给收藏者的话，卡也跟着变长。
+
+    ``fans`` 只在被画的人看自己那张时给：底部多一条"谁收藏了你"。
+    """
     rarity_color = RARITY_COLORS.get(card.rarity, RARITY_COLORS["R"])
     measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
     subject_name = _clean_text(card.subject_name)
@@ -200,7 +206,9 @@ def render_card(
     ]
     # 插画卡的主图更高一些，卡面整体跟着变长。
     lift = _ART_LIFT if art else 0
-    height = CARD_H + 30 * len(extra_lines) + lift
+    fans_text = _clean_text(fans)
+    fans_h = _FANS_H if fans_text else 0
+    height = CARD_H + 30 * len(extra_lines) + lift + fans_h
 
     base = _night((CARD_W, height), card.card_id).convert("RGBA")
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
@@ -285,7 +293,19 @@ def render_card(
         draw.text((70, skill_top + 46 + 30 * index), line, font=skill_font, fill=_SILVER)
 
     # 她的批注，以及升星后只写给这位收藏者的话
-    note_top = height - 50 - 30 * (len(note_lines) + len(extra_lines))
+    note_top = height - 50 - fans_h - 30 * (len(note_lines) + len(extra_lines))
+    if fans_text:
+        fans_font = _font(18)
+        width = min(CARD_W - 96, draw.textlength(fans_text, font=fans_font) + 40)
+        left = (CARD_W - width) / 2
+        draw.rounded_rectangle(
+            [left, height - 50 - fans_h + 6, left + width, height - 50 - 4],
+            radius=15,
+            fill=(*rarity_color, 46),
+            outline=(*rarity_color, 160),
+            width=1,
+        )
+        _centered(draw, height - 50 - fans_h + 10, fans_text, fans_font, _GOLD)
     for index, line in enumerate(note_lines):
         draw.text((60, note_top + 30 * index), line, font=note_font, fill=_SOFT)
     for index, line in enumerate(extra_lines):
