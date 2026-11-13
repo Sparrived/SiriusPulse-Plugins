@@ -472,3 +472,161 @@ def _art_panel(art: bytes, *, size: tuple[int, int]) -> Image.Image | None:
     panel = Image.new("RGBA", size, (0, 0, 0, 0))
     panel.paste(cropped, (0, 0), mask)
     return panel
+
+
+# ---------------------------------------------------------------------------
+# 玩法卡：/抽卡 帮助
+# ---------------------------------------------------------------------------
+
+HELP_W = 900
+_HELP_PAD = 36
+_HELP_CMD_W = 320
+_HELP_LINE = 30
+#: 玩法卡的面板比卡面的深一些，盖住背后的星星，字更清楚。
+_HELP_PANEL = (14, 20, 42, 175)
+
+
+def _wrap_words(
+    draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, width: int
+) -> list[str]:
+    """按空格折行（指令和参数不从中间断开）；单个词太长才逐字折。"""
+    lines: list[str] = []
+    line = ""
+    for word in text.split(" "):
+        candidate = f"{line} {word}" if line else word
+        if draw.textlength(candidate, font=font) <= width:
+            line = candidate
+            continue
+        if line:
+            lines.append(line)
+        if draw.textlength(word, font=font) <= width:
+            line = word
+        else:
+            *head, line = _wrap(draw, word, font, width)
+            lines.extend(head)
+    if line:
+        lines.append(line)
+    return lines
+
+
+def _help_layout(
+    draw: ImageDraw.ImageDraw,
+    sections: list[tuple[str, list[tuple[str, str]]]],
+) -> list[tuple[str, list[tuple[list[str], list[str]]]]]:
+    """每一条拆成 (指令的几行, 说明的几行)，量好宽度再画。"""
+    cmd_font, desc_font = _font(22, bold=True), _font(21)
+    desc_w = HELP_W - 2 * _HELP_PAD - 48 - _HELP_CMD_W
+    laid = []
+    for title, items in sections:
+        rows = []
+        for cmd, desc in items:
+            rows.append(
+                (
+                    _wrap_words(draw, _clean_text(cmd), cmd_font, _HELP_CMD_W - 16),
+                    _wrap(draw, _clean_text(desc), desc_font, desc_w),
+                )
+            )
+        laid.append((title, rows))
+    return laid
+
+
+def render_help(
+    sections: list[tuple[str, list[tuple[str, str]]]],
+    *,
+    persona_name: str,
+    facts: list[str],
+) -> bytes:
+    """玩法卡：一张图讲清楚图鉴怎么玩。
+
+    ``sections`` 是 (分组标题, [(指令, 说明), ...])；``facts`` 是本群眼下的规则
+    （每轮几抽、几点刷新、保底），画在顶上。
+    """
+    measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    laid = _help_layout(measure, sections)
+    fact_font = _font(20)
+    fact_lines = _wrap(
+        measure, "  ·  ".join(_clean_text(f) for f in facts), fact_font, HELP_W - 120
+    )
+
+    header_h = 150 + _HELP_LINE * len(fact_lines)
+    body_h = 0
+    for _title, rows in laid:
+        body_h += 62 + sum(max(len(c), len(d)) * _HELP_LINE + 12 for c, d in rows) + 18
+    rarity_h = 120
+    height = header_h + body_h + rarity_h + 70
+
+    base = _night((HELP_W, height), "gacha-help").convert("RGBA")
+    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    draw.rounded_rectangle([10, 10, HELP_W - 11, height - 11], radius=28, outline=_GOLD, width=3)
+    draw.rounded_rectangle(
+        [22, 22, HELP_W - 23, height - 23], radius=20, outline=(*_SILVER, 90), width=1
+    )
+
+    # 顶栏：标题、她的签名、本群眼下的规则
+    title = "群友图鉴 · 怎么玩"
+    _centered(draw, 46, title, _font_for(title, 44, cute=True), _SILVER, width=HELP_W)
+    sign = f"—— 卡都是{_clean_text(persona_name)[:10]}画的"
+    _centered(draw, 104, sign, _font_for(sign, 20, cute=True), _FAINT, width=HELP_W)
+    for index, line in enumerate(fact_lines):
+        _centered(draw, 140 + _HELP_LINE * index, line, fact_font, _GOLD, width=HELP_W)
+
+    cmd_font, desc_font = _font(22, bold=True), _font(21)
+    y = header_h
+    for title, rows in laid:
+        block_h = 62 + sum(max(len(c), len(d)) * _HELP_LINE + 12 for c, d in rows)
+        draw.rounded_rectangle(
+            [_HELP_PAD, y, HELP_W - _HELP_PAD, y + block_h], radius=18, fill=_HELP_PANEL
+        )
+        section_title = _clean_text(title)
+        draw.text(
+            (_HELP_PAD + 24, y + 16),
+            section_title,
+            font=_font_for(section_title, 26, cute=True),
+            fill=_GOLD,
+        )
+        row_y = y + 60
+        for cmd_lines, desc_lines in rows:
+            for index, line in enumerate(cmd_lines):
+                draw.text(
+                    (_HELP_PAD + 24, row_y + _HELP_LINE * index), line, font=cmd_font, fill=_SILVER
+                )
+            for index, line in enumerate(desc_lines):
+                draw.text(
+                    (_HELP_PAD + 24 + _HELP_CMD_W, row_y + _HELP_LINE * index),
+                    line,
+                    font=desc_font,
+                    fill=_SOFT,
+                )
+            row_y += max(len(cmd_lines), len(desc_lines)) * _HELP_LINE + 12
+        y += block_h + 18
+
+    # 四种卡
+    chips = [
+        ("R", "常驻卡", "每位群友一张"),
+        ("SR", "心情卡", "她心情好时画"),
+        ("SSR", "觉醒卡", "三星卡觉醒"),
+        ("UR", "名场面", "限量，引用原话"),
+    ]
+    chip_w = (HELP_W - 2 * _HELP_PAD - 3 * 14) // 4
+    for index, (rarity, name, hint) in enumerate(chips):
+        x = _HELP_PAD + index * (chip_w + 14)
+        color = RARITY_COLORS[rarity]
+        draw.rounded_rectangle(
+            [x, y + 4, x + chip_w, y + rarity_h - 10],
+            radius=16,
+            fill=(*color, 40),
+            outline=color,
+            width=2,
+        )
+        _centered_in(draw, x, y + 14, chip_w, rarity, _font(26, bold=True), color)
+        _centered_in(draw, x, y + 50, chip_w, name, _font(20, bold=True), _SILVER)
+        _centered_in(draw, x, y + 78, chip_w, hint, _font(16), _SOFT)
+
+    footer = "不想被画进图鉴？发 /我的卡 退出，随时可以回来"
+    _centered(draw, height - 52, footer, _font(18), _FAINT, width=HELP_W)
+
+    base = Image.alpha_composite(base, overlay)
+    out = io.BytesIO()
+    base.convert("RGB").save(out, format="PNG", optimize=True)
+    return out.getvalue()

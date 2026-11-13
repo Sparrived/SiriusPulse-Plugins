@@ -921,10 +921,14 @@ async def test_every_reply_is_said_live_in_her_own_words_and_rules_are_never_los
     await chat.send("/送卡 小红", user="u-wang")
     assert chat.said().startswith("送谁？") and "/送卡 小红 17" in chat.said()
 
-    # 帮助：她先说一句，指令列表照旧完整给出。
+    # 帮助：她先说一句，再附上一张玩法卡，指令和本群眼下的规则都画在上面。
     chat.engine.voice = ["想玩图鉴？我教你～"]
     await chat.send("/抽卡 帮助", user="u-wang")
-    assert chat.said().startswith("想玩图鉴？") and "/升星 <编号>" in chat.said()
+    assert chat.said() == "想玩图鉴？我教你～"
+    [guide] = chat.images()
+    assert guide.width == 900
+    assert "/升星 <编号>" in chat.drawn and "/同意交换" in " ".join(chat.drawn)
+    assert any("每天 00:00 刷新" in text and "第 40 抽保底" in text for text in chat.drawn)
 
 
 @pytest.mark.asyncio

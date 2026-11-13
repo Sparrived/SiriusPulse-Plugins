@@ -63,7 +63,7 @@ from .store import (
     Owned,
     SoldOut,
 )
-from .visual import render_card, render_collection
+from .visual import render_card, render_collection, render_help
 from .voice import (
     RECENT_LINES,
     Must,
@@ -90,17 +90,51 @@ from .writer import (
     parse_scene,
 )
 
-_HELP = (
-    "/抽卡：抽一张群友的收藏卡，次数到点刷新；/抽卡 刷新时间 看什么时候刷新\n"
-    "/图鉴：看看你收集了哪些卡\n"
-    "/卡 <名字或编号>：看一张你已经抽到的卡\n"
-    "/送卡 <人> <编号>：把一张卡送给别人\n"
-    "/交换 <人> <我的编号> <他的编号>：提出交换，对方发 /同意交换 或 /拒绝交换\n"
-    "/升星 <编号>：用一张重复的卡升星，我会在你那张上多写一句\n"
-    "/觉醒 <编号>：三星卡觉醒成 SSR 超级卡，我专门为你画一张插画\n"
-    "/我的卡：看看我给你画的卡；/我的卡 退出 不想被画进图鉴，/我的卡 加入 回来\n"
-    "/我的卡 画我：同意我画觉醒插画时照你本人登记的形象画你；/我的卡 不画我 撤回"
-)
+#: 玩法：/抽卡 帮助 画成一张玩法卡，画不出来时用文字。
+_HELP_SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
+    (
+        "抽卡",
+        [
+            ("/抽卡", "抽一张本群群友的收藏卡，次数到点刷新"),
+            ("/抽卡 刷新时间", "看本群每天几点刷新、下次是什么时候"),
+            ("/抽卡 刷新", "仅 root：马上刷新本群的抽卡次数"),
+            ("/抽卡 刷新时间 08:00 20:00", "仅 root：给本群另设刷新时刻，写「默认」恢复"),
+        ],
+    ),
+    (
+        "收藏",
+        [
+            ("/图鉴", "看你在本群收集了哪些卡，没抽到的是问号"),
+            ("/卡 <名字或编号>", "看一张你已经抽到的卡，比如 /卡 17"),
+            ("/我的卡", "看我给你画的那张"),
+        ],
+    ),
+    (
+        "送与换",
+        [
+            ("/送卡 <人> <编号>", "把一张卡送给群友，可以直接 @ 他"),
+            (
+                "/交换 <人> <我的编号> <他的编号>",
+                "对方 10 分钟内发 /同意交换 或 /拒绝交换",
+            ),
+        ],
+    ),
+    (
+        "养成",
+        [
+            ("/升星 <编号>", "用一张重复的卡升一星，我多写一句悄悄话（最多 3 星）"),
+            ("/觉醒 <编号>", "三星卡觉醒成 SSR，我专门为你画一张插画"),
+        ],
+    ),
+    (
+        "关于你",
+        [
+            ("/我的卡 退出 / 加入", "不想被画进图鉴就退出，想回来再加入"),
+            ("/我的卡 画我 / 不画我", "同意或撤回：觉醒插画照你本人登记的形象画你"),
+        ],
+    ),
+]
+_HELP = "\n".join(f"{cmd}：{desc}" for _, items in _HELP_SECTIONS for cmd, desc in items)
 
 # 受管人物生图没做成时，觉醒卡照旧用象征物画；这几种原因要在群里如实说一句。
 _LIKENESS_FALLBACK_NOTES = {
@@ -163,7 +197,7 @@ class GachaPlugin(PluginBase):
     _plugin_name = "gacha"
     _plugin_display_name = "群友图鉴"
     _plugin_description = "她给群友画收藏卡：/抽卡 每天一抽，/图鉴 看收集进度，/送卡 /交换 /升星 /觉醒，" "/我的卡 退出 随时不再入画。"
-    _plugin_version = "0.5.0"
+    _plugin_version = "0.5.1"
     _plugin_author = "Sirius Pulse"
     _plugin_min_framework_version = "1.3.0"
     _plugin_dependencies = ["httpx>=0.24.0", "Pillow>=9.0.0"]
@@ -398,16 +432,30 @@ class GachaPlugin(PluginBase):
             "觉醒": self._awaken,
         }
         handler = handlers.get(cmd.command)
-        if handler is None or (args and args[0] in {"help", "帮助"}):
-            # 指令列表是规则，整段由系统接在她的话后面。
-            return [
-                PluginResponse.ok(text=await self._speak("help", group_id=group_id, tail=_HELP))
-            ]
+        if handler is None or (args and args[0] in {"help", "帮助", "玩法"}):
+            return [await self._help(group_id)]
         try:
             return [await handler(group_id, args)]
         except OSError as exc:
             self.logger.warning("图鉴画图失败：%s", exc)
             return [PluginResponse.ok(text=await self._speak("render_failed", group_id=group_id))]
+
+    async def _help(self, group_id: str) -> PluginResponse:
+        """玩法卡：她说一句，附上一张讲清楚怎么玩的图；画不出来就把指令列表接在后面。"""
+        schedule = self._schedule(group_id)
+        facts = [
+            f"每轮每人 {self._option('draws_per_day', 1, low=1, high=20)} 抽",
+            f"每天 {format_times(schedule.times)} 刷新",
+            f"第 {PITY_AT} 抽保底 SSR 以上",
+        ]
+        try:
+            png = await asyncio.to_thread(
+                render_help, _HELP_SECTIONS, persona_name=self._persona_name(), facts=facts
+            )
+        except OSError as exc:
+            self.logger.warning("玩法卡画不出来：%s", exc)
+            return PluginResponse.ok(text=await self._speak("help", group_id=group_id, tail=_HELP))
+        return self._image(await self._speak("help", group_id=group_id), png)
 
     async def _reply(self, group_id: str, occasion: str, **kwargs: Any) -> PluginResponse:
         """一句纯文字回复：她现场说。"""
